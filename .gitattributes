@@ -1,4 +1,19 @@
-*.dll filter=lfs diff=lfs merge=lfs -text
-*.lib filter=lfs diff=lfs merge=lfs -text
-*.pdb filter=lfs diff=lfs merge=lfs -text
-*.exe filter=lfs diff=lfs merge=lfs -text
+# Normalize line endings for text files (good default)
+* text=auto
+
+# --- Limit LFS strictly to your committed OpenCV runtime binaries ---
+# Keep headers as normal text
+third_party/opencv/runtime/include/**            text
+
+# Track only the redistributable binary artifacts with LFS
+third_party/opencv/runtime/x64/vc16/bin/*.dll    filter=lfs diff=lfs merge=lfs -text
+third_party/opencv/runtime/x64/vc16/bin/*.pdb    filter=lfs diff=lfs merge=lfs -text
+third_party/opencv/runtime/x64/vc16/bin/*.exe    filter=lfs diff=lfs merge=lfs -text
+third_party/opencv/runtime/x64/vc16/lib/*.lib    filter=lfs diff=lfs merge=lfs -text
+
+# --- Make sure build outputs never get LFS’ed by accident ---
+build-*/**                                        -filter -diff -merge -text
+**/build-*/**                                     -filter -diff -merge -text
+
+# Treat everything under third_party as vendored for GitHub linguist stats (optional)
+third_party/** linguist-vendored
