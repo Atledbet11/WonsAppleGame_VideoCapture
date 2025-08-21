@@ -1,41 +1,28 @@
-# Prerequisites
-*.d
+# --- Build trees (never commit) ---
+/build-*/
+/**/build-*/
+/**/CMakeFiles/
+/**/CMakeCache.txt
+/**/cmake_install.cmake
+/**/*.dir/
+/**/*.vcxproj*
+/**/*.sln
+/.vs/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
+# --- Generic binaries we DON'T want by default ---
+*.exe
+*.dll
 *.pdb
-
-# Compiled Dynamic libraries
+*.lib
+*.ilk
+*.obj
+*.o
 *.so
 *.dylib
-*.dll
 
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# debug information files
-*.dwo
+# If you move your curated runtime into third_party/opencv/runtime, you can be even stricter:
+!third_party/opencv/runtime/**
+# and re-ignore any accidental build dirs under third_party:
+third_party/**/build*/
+third_party/**/CMakeFiles/
+third_party/**/CMakeCache.txt

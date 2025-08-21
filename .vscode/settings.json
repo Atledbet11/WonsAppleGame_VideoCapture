@@ -1,0 +1,8 @@
+{
+    "cmake.sourceDirectory": "F:/ComputerScience/WonsAppleGame/VideoCapture/WonsAppleGame_VideoCapture",
+    "files.associations": {
+        "iostream": "cpp"
+    },
+    "cmake.useCMakePresets": "always",
+    "cmake.configureOnOpen": true
+}

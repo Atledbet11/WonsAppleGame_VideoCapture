@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "Win64-MSVC",
+            "intelliSenseMode": "windows-msvc-x64",
+            "compilerPath": "cl.exe",
+            "includePath": [
+                "F:/ComputerScience/opencv/build/install/include",
+                "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.0/include",
+                "${workspaceFolder}"
+            ],
+            "defines": [
+                "WIN32",
+                "_WIN32",
+                "NOMINMAX"
+            ],
+            "configurationProvider": "ms-vscode.cmake-tools"
+        }
+    ],
+    "version": 4
+}

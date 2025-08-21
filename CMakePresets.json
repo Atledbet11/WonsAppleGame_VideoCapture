@@ -1,0 +1,76 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Visual Studio 16 2019",
+      "architecture": "x64",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release"
+      }
+    },
+
+    {
+      "name": "cuda-debug",
+      "displayName": "CUDA + Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-cuda",
+      "cacheVariables": {
+        "USE_LOCAL_OPENCV": "ON"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "displayName": "CUDA + Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-cuda",
+      "cacheVariables": {
+        "USE_LOCAL_OPENCV": "ON"
+      }
+    },
+
+    {
+      "name": "cpu-debug",
+      "displayName": "CPU-only + Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-cpu",
+      "cacheVariables": {
+        "USE_LOCAL_OPENCV": "OFF"
+      }
+    },
+    {
+      "name": "cpu-release",
+      "displayName": "CPU-only + Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-cpu",
+      "cacheVariables": {
+        "USE_LOCAL_OPENCV": "OFF"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    {
+      "name": "cuda-debug",
+      "configurePreset": "cuda-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "cuda-release",
+      "configurePreset": "cuda-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "cpu-debug",
+      "configurePreset": "cpu-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release",
+      "configuration": "Release"
+    }
+  ]
+}
