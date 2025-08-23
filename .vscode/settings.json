@@ -1,7 +1,22 @@
 {
     "cmake.sourceDirectory": "F:/ComputerScience/WonsAppleGame/VideoCapture/WonsAppleGame_VideoCapture",
     "files.associations": {
-        "iostream": "cpp"
+        "iostream": "cpp",
+        "vector": "cpp",
+        "array": "cpp",
+        "bitset": "cpp",
+        "deque": "cpp",
+        "initializer_list": "cpp",
+        "list": "cpp",
+        "queue": "cpp",
+        "regex": "cpp",
+        "span": "cpp",
+        "stack": "cpp",
+        "type_traits": "cpp",
+        "xhash": "cpp",
+        "xstring": "cpp",
+        "xtree": "cpp",
+        "xutility": "cpp"
     },
     "cmake.useCMakePresets": "always",
     "cmake.configureOnOpen": true
