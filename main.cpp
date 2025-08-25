@@ -6,7 +6,11 @@
 
 #include <iostream>
 #include <regex>
+#include <vector>
+#include <filesystem>
+#include <algorithm> // For std::max
 
+#define NOMINMAX
 #include <windows.h>
 
 using namespace std;
@@ -14,13 +18,168 @@ using namespace cv;
 using namespace dnn;
 using namespace cuda;
 
+namespace fs = std::filesystem;
+
+// Trackbar names (keep consistent)
+static const char* TB_LOW   = "Low Threshold";
+static const char* TB_HIGH  = "High Threshold";
+static const char* TB_KER   = "Kernel(3/5/7)";
+
+enum modes {
+	DEFAULT,
+	CANNY,
+	MODES_END
+};
+
 struct VideoDevice {
 	int index;
 	string name;
 };
 
+struct CannyUIContext {
+	Mat* gray;				// Gray Frame
+	Mat* canny;				// Canny Frame
+	int* lowThreshold;
+	int* highThreshold;
+	int* kernelIndex;
+	int* kernel;
+	const char* window;		// Window Name
+};
+
+
+static std::string timestamp()
+{
+	using clock = std::chrono::system_clock;
+	auto now = clock::now();
+
+	// Split into whole seconds since epoch and fractional milliseconds
+	auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+	auto sec_since_epoch = std::chrono::duration_cast<std::chrono::seconds>(ms_since_epoch);
+
+	// Milliseconds = remainder of division
+	auto ms = ms_since_epoch - sec_since_epoch;
+
+	// Convert seconds-since-epoch to calendar time
+	std::time_t t = sec_since_epoch.count();
+	tm tstamp{};
+	#ifdef _WIN32
+	localtime_s(&tstamp, &t);
+	#else
+	localtime_r(&t, &tstamp);
+	#endif
+
+	// Format: YYYYmmdd_HHMMSS_mmm
+	std::ostringstream oss;
+	oss << std::put_time(&tstamp, "%Y%m%d_%H%M%S")
+		<< '_' << std::setw(3) << std::setfill('0') << ms.count();
+
+	return oss.str();
+}
+
+struct Recorder {
+	VideoWriter writer;
+	bool active = false;
+	bool save_frames = false;
+	fs::path out_path;
+
+	// Try MP4 first; fall back to AVI if needed
+	bool start(int width, int height, double fps, const fs::path& outdir, int mode)
+	{
+		if (active) return true;
+
+		bool isColor = true;
+
+		switch (mode) {
+			case CANNY:
+				isColor = false;
+				break;
+		}
+
+		int fourcc_mp4v = VideoWriter::fourcc('m','p','4','v');
+		int fourcc_xvid = VideoWriter::fourcc('X','V','I','D');
+
+		out_path = outdir / ("recording_" + timestamp() + ".mp4");
+		bool ok = writer.open(out_path.string(), fourcc_mp4v, (fps > 0 ? fps : 30.0),
+								Size(width, height), isColor);
+
+		if (!ok) {
+			// Fallback to AVI/XVID
+			out_path = outdir / ("recording_" + timestamp() + ".avi");
+			ok = writer.open(out_path.string(), fourcc_xvid, (fps > 0 ? fps : 30.0),
+								Size(width, height), isColor);
+		}
+
+		if (!ok) {
+			cerr << "Failed to open VideoWriter for recording.\n";
+			return false;
+		}
+
+		active = true;
+		cout << "Recording started: " << out_path.string() << "\n";
+		return true;
+	}
+
+	void write(const Mat& frame)
+	{
+		if (active && !frame.empty()) {
+			writer.write(frame);
+		}
+	}
+
+	void stop()
+	{
+		if (active) {
+			writer.release();
+			active = false;
+			save_frames = false;
+			cout << "Recording stopped: " << out_path.string() << "\n";
+		}
+	}
+};
+
+static fs::path outputDirectory() {
+	fs::path out = fs::current_path() / "output";
+	error_code ec;
+	if (!fs::exists(out, ec)) {
+		fs::create_directories(out, ec);
+		if (ec) {
+			cerr << "Failed to create output dir: " << out << " (" << ec.message() << " )\n";
+		}
+	}
+	return out;
+}
+
+static fs::path recordingDirectory() {
+	fs::path out = outputDirectory() / ("recording_" + timestamp());
+	error_code ec;
+	if (!fs::exists(out, ec)) {
+		fs::create_directories(out, ec);
+		if (ec) {
+			cerr << "Failed to create recording dir: " << out << " (" << ec.message() << " )\n";
+		}
+	}
+	return out;
+}
+
+static bool saveSnapshot(const Mat& frame, const fs::path& outdir, std::string* outPathStr = nullptr)
+{
+	if (frame.empty()) {
+		cerr << "Snapshot failed: empty frame.\n";
+		return false;
+	}
+	fs::path filepath = outdir / ("snapshot_" + timestamp() + ".png");
+	if (imwrite(filepath.string(), frame)) {
+		cout << "Saved snapshot: " << filepath.string() << "\n";
+		if (outPathStr) *outPathStr = filepath.string();
+		return true;
+	} else {
+		cerr << "imwrite failed for: " << filepath.string() << "\n";
+		return false;
+	}
+}
+
 // This will execute a command and capture and return its output.
-string run_command(const string& cmd) {
+string runCommand(const string& cmd) {
 
 // If ran on windows
 #ifdef _WIN32
@@ -62,7 +221,7 @@ vector<VideoDevice> fetchVideoDevices() {
 	// FFmpeg command to list DirectShow devices
 	const string cmd = "ffmpeg -hide_banner -f dshow -list_devices true -i dummy";
 
-	const string result = run_command(cmd);
+	const string result = runCommand(cmd);
 	if (result.empty()) {
 		cerr << "FFmpeg output empty\n";
 		return deviceList;
@@ -222,7 +381,6 @@ static int selectVideoDevice(vector<VideoDevice> deviceList) {
 
 }
 
-
 static bool ocvBuiltWithCUDA() {
 	try {
 		// Fast path: CUDA device count > 0 implies CUDA runtime available AND OpenCV built with CUDA
@@ -276,7 +434,60 @@ static void printCUDAReport() {
 	}
 }
 
+// Callback function for trackbars to work on canny view.
+void onTrackbarThresholds(int pos, void* userData) {
+	auto* ctx = static_cast<CannyUIContext*>(userData);
+	if (!ctx || !ctx->gray || !ctx->canny) return;
+	if (ctx->gray->empty()) return;
 
+	if (*(ctx->highThreshold) < *(ctx->lowThreshold)) *(ctx->highThreshold) = *(ctx->lowThreshold);
+
+	Canny(*(ctx->gray), *(ctx->canny), *(ctx->lowThreshold), *(ctx->highThreshold), *(ctx->kernel));
+	imshow(ctx->window, *(ctx->canny));
+}
+
+// Kernel slider moved: remap and adjust threshold maxes
+void onTrackbarKernel(int pos, void* userdata) {
+	auto* ctx = static_cast<CannyUIContext*>(userdata);
+	if (!ctx) return;
+
+	// Decide new max based on kernel size.
+	// (Heuristic: scale with ksize; adjust to your taste.)
+	// 3 → 255, 5 → 425, 7 → 595
+	int newMax;
+
+	switch (*(ctx->kernelIndex)) {
+		case 0:
+			newMax = 255;
+			*(ctx->kernel) = 3;
+			break;
+		case 1:
+			newMax = 4095;
+			*(ctx->kernel) = 5;
+			break;
+		case 2:
+			newMax = 35565;
+			*(ctx->kernel) = 7;
+			break;
+		default:
+			cerr << "Error with kernel size!\n";
+			return;
+	}
+
+	// Update trackbar ranges dynamically
+	setTrackbarMax(TB_LOW,  ctx->window, newMax);
+	setTrackbarMax(TB_HIGH, ctx->window, newMax);
+
+	// Clamp current values to the new max
+	if (*(ctx->lowThreshold)  > newMax) *(ctx->lowThreshold)  = newMax;
+	if (*(ctx->highThreshold) > newMax) *(ctx->highThreshold) = newMax;
+
+	setTrackbarPos(TB_LOW,  ctx->window, *(ctx->lowThreshold));
+	setTrackbarPos(TB_HIGH, ctx->window, *(ctx->highThreshold));
+
+	// Recompute with updated settings
+	onTrackbarThresholds(0, userdata);
+}
 
 int main() {
 
@@ -297,19 +508,159 @@ int main() {
 
 	if (!cap.isOpened()) {
 		cerr << "Failed to open device\n";
-		return 1;
+		return -1;
 	}
+
+	Recorder rec;
 
 	cap.set(CAP_PROP_FRAME_WIDTH, 1920);
 	cap.set(CAP_PROP_FRAME_HEIGHT, 1080);
 	cap.set(CAP_PROP_FPS, 60);
 
+	bool quit = false;
+
 	Mat frame;
+	Mat gray_frame;
+	Mat canny_frame;
+
+	int lowThreshold = 25;
+	int highThreshold = 25;
+	int kernelIndex = 0;
+	int kernelSize = 3;
+	int mode = 0;
+	int prevMode = -1;
+	fs::path outDir = outputDirectory();
+	fs::path recDir;
+	int recFrame = 0;
+	int recRate = 8;
+
+	const char* WIN_NAME = "Display";
+	namedWindow(WIN_NAME, WINDOW_AUTOSIZE);
+
+	bool cannyUIReady = false;
+	CannyUIContext ctx { &gray_frame, &canny_frame, &lowThreshold, &highThreshold, &kernelIndex, &kernelSize, WIN_NAME};
 
 	for(;;) {
+
 		if(!cap.read(frame)) break;
-		imshow("Capture", frame);
-		if(waitKey(1) == 27) break;
+
+		// Mode has changed
+		if (mode != prevMode) {
+			if (mode == 1 && !cannyUIReady) {
+				// Create trackbars with initial max; these will be updated by kernel callback
+				createTrackbar(TB_LOW,  WIN_NAME, &lowThreshold, 255, onTrackbarThresholds, &ctx);
+				createTrackbar(TB_HIGH, WIN_NAME, &highThreshold, 255, onTrackbarThresholds, &ctx);
+
+				// Kernel slider (0..2). use dedicated callback.
+				createTrackbar(TB_KER, WIN_NAME, &kernelIndex, 2, onTrackbarKernel, &ctx);
+
+				// Initialize maxes based on current kernel and render once
+				onTrackbarKernel(kernelIndex, &ctx);
+				cannyUIReady = true;
+			}
+			prevMode = mode;
+		}
+
+		// Display switch
+		// Displays regular frame or canny depending on mode value.
+		switch (mode) {
+			case DEFAULT: // default
+				imshow(WIN_NAME, frame);
+				break;
+			case CANNY: // canny
+				// Convert the frame to canny
+				cvtColor(frame, gray_frame, COLOR_BGR2GRAY);
+				blur(gray_frame, canny_frame, Size(3, 3));
+				Canny(canny_frame, canny_frame, lowThreshold, highThreshold, kernelSize);
+
+				// Generate and display the canny view
+				onTrackbarThresholds(0, &ctx);
+				break;
+		}
+
+		// If recording is active
+		if (rec.active) {
+
+			// Write the current modes frame to the file.
+			// Consider rewriting the display logic to use a shared mat
+			// Doing this would remove the need for these switch cases.
+			switch (mode) {
+				case DEFAULT: // default
+					// Write the current frame to the file.
+					rec.write(frame);
+					break;
+				case CANNY: // canny
+					// Write the current canny_frame to the file.
+					rec.write(canny_frame);
+					break;
+			}
+
+			// If save_frames is true periodicaly save a screenshot
+			if ( (recFrame++ % recRate == 0) && rec.save_frames ) {
+
+				// Save the current modes frame
+				// Consider rewriting the display logic to use a shared mat
+				// Doing this would remove the need for these switch cases.
+				switch (mode) {
+				case DEFAULT: // default
+					// Save the screenshot
+					saveSnapshot(frame, recDir, nullptr);
+					break;
+				case CANNY: // canny
+					// Save the screenshot
+					saveSnapshot(canny_frame, recDir, nullptr);
+					break;
+				}
+
+			}
+
+		}
+
+		// This routine will process any keyboard inputs.
+		int key = waitKey(1);
+		switch (key) {
+			case 27: // "ESC" to quit
+				quit = true;
+				break;
+			case 'M': // Cycle Modes
+			case 'm': // Cycle Modes
+				prevMode = mode++;
+				//mode++;
+				if ( mode >= MODES_END ) {
+					mode = 0;
+				}
+				break;
+			case 'p': // Screenshot
+			case 'P': // Screenshot
+				switch (mode) {
+				case DEFAULT: // default
+					// Save the screenshot
+					saveSnapshot(frame, recDir, nullptr);
+					break;
+				case CANNY: // canny
+					// Save the screenshot
+					saveSnapshot(canny_frame, recDir, nullptr);
+					break;
+				}
+				break;
+			case 'R': // Recording while Saving frames periodicaly
+				rec.save_frames = true;
+			case 'r': // Regular recording
+				if (rec.active) {
+					rec.stop();
+				} else {
+					int width  = static_cast<int>(cap.get(CAP_PROP_FRAME_WIDTH));
+					int height = static_cast<int>(cap.get(CAP_PROP_FRAME_HEIGHT));
+					double fps = cap.get(CAP_PROP_FPS);
+					if (fps <= 0 || fps > 240) fps = 30.0; // sane default
+					recDir = recordingDirectory();
+					if (!rec.start(width, height, fps, recDir, mode)) {
+						cerr << "Recording could not be started.\n";
+					}
+				}
+
+		}
+		if ( quit ) break;
 	}
 
 	return 0;
