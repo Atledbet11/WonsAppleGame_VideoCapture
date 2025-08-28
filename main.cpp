@@ -1023,8 +1023,8 @@ int main() {
 
 				// Reshape the frame so that it will fit in the model.
 				// Model expects 1920x1920
-				constexpr int MODEL_W = 1920;
-				constexpr int MODEL_H = 1920;
+				constexpr int MODEL_W = 960;
+				constexpr int MODEL_H = 960;
 
 				float scale = 1.f; int dx = 0, dy = 0;
 				cv::Mat input = letterbox_reshape(frame, MODEL_W, MODEL_H, scale, dx, dy);
@@ -1036,11 +1036,11 @@ int main() {
 
 				printBlobInfo(blob, "[DNN] Input");
 
-				cout << "[DNN] setInput(...)\n";
+				//cout << "[DNN] setInput(...)\n";
 				net.setInput(blob);
 
 				try {
-					cout << "[DNN] forward() starting...\n";
+					//cout << "[DNN] forward() starting...\n";
 					TickMeter tm; tm.start();
 					out = net.forward();
 					tm.stop();
