@@ -8,12 +8,22 @@ set(CMAKE_IMPORT_FILE_VERSION 1)
 # Import target "opencv_world" for configuration "Release"
 set_property(TARGET opencv_world APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
 set_target_properties(opencv_world PROPERTIES
-  IMPORTED_IMPLIB_RELEASE "${_IMPORT_PREFIX}/x64/vc16/lib/opencv_world455.lib"
-  IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/x64/vc16/bin/opencv_world455.dll"
+  IMPORTED_IMPLIB_RELEASE "${_IMPORT_PREFIX}/x64/vc16/lib/opencv_world470.lib"
+  IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/x64/vc16/bin/opencv_world470.dll"
   )
 
 list(APPEND _cmake_import_check_targets opencv_world )
-list(APPEND _cmake_import_check_files_for_opencv_world "${_IMPORT_PREFIX}/x64/vc16/lib/opencv_world455.lib" "${_IMPORT_PREFIX}/x64/vc16/bin/opencv_world455.dll" )
+list(APPEND _cmake_import_check_files_for_opencv_world "${_IMPORT_PREFIX}/x64/vc16/lib/opencv_world470.lib" "${_IMPORT_PREFIX}/x64/vc16/bin/opencv_world470.dll" )
+
+# Import target "opencv_img_hash" for configuration "Release"
+set_property(TARGET opencv_img_hash APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(opencv_img_hash PROPERTIES
+  IMPORTED_IMPLIB_RELEASE "${_IMPORT_PREFIX}/x64/vc16/lib/opencv_img_hash470.lib"
+  IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/x64/vc16/bin/opencv_img_hash470.dll"
+  )
+
+list(APPEND _cmake_import_check_targets opencv_img_hash )
+list(APPEND _cmake_import_check_files_for_opencv_img_hash "${_IMPORT_PREFIX}/x64/vc16/lib/opencv_img_hash470.lib" "${_IMPORT_PREFIX}/x64/vc16/bin/opencv_img_hash470.dll" )
 
 # Commands beyond this point should not need to know the version.
 set(CMAKE_IMPORT_FILE_VERSION)

@@ -10,21 +10,30 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(USE_LOCAL_OPENCV "Use local OpenCV (CUDA) on this machine" OFF)
 
 if(USE_LOCAL_OPENCV)
-    # Personal OpenCV build with Cuda
-    set(OpenCV_DIR "F:/ComputerScience/opencv/build/install/x64/vc16/lib")
+  # Personal OpenCV build with Cuda
+  #set(OpenCV_DIR "F:/ComputerScience/opencv/build/install/x64/vc16/lib")
+  set(OpenCV_DIR "F:/ComputerScience/opencv-470/build/install/x64/vc16/lib")
 else()
-    # Redistributable CPU bound build of OpenCV
-    set(OpenCV_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/opencv/runtime/x64/vc16/lib")
+  # Redistributable CPU bound build of OpenCV
+  set(OpenCV_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/opencv/runtime/x64/vc16/lib")
 endif()
 
 if(MSVC)
-    set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
+  set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
 endif()
 
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 add_executable(WonsAppleGame_VideoCapture main.cpp)
+
+# ---- Model asset copy (post-build) ----
+set(MODEL_SRC "${CMAKE_CURRENT_LIST_DIR}/model/best.onnx")
+
+# Make the model visible in IDEs (it won't be compiled)
+if(EXISTS "${MODEL_SRC}")
+  target_sources(WonsAppleGame_VideoCapture PRIVATE "${MODEL_SRC}")
+endif()
 
 target_link_libraries(WonsAppleGame_VideoCapture ${OpenCV_LIBS})
 
@@ -70,8 +79,8 @@ if(NOT USE_LOCAL_OPENCV)
   if(_OPENCV_BIN_DIR)
     add_custom_command(TARGET WonsAppleGame_VideoCapture POST_BUILD
       COMMAND ${CMAKE_COMMAND} -Dsrc=${_OPENCV_BIN_DIR}
-                                 -Ddst=$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>
-                                 -P ${_SCRIPT_COPY_DLLS}
+                               -Ddst=$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>
+                               -P ${_SCRIPT_COPY_DLLS}
       COMMENT "Copying CPU OpenCV DLLs"
       VERBATIM)
   endif()
@@ -79,19 +88,28 @@ else()
   if(_OPENCV_BIN_DIR)
     add_custom_command(TARGET WonsAppleGame_VideoCapture POST_BUILD
       COMMAND ${CMAKE_COMMAND} -Dsrc=${_OPENCV_BIN_DIR}
-                                 -Ddst=$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>
-                                 -P ${_SCRIPT_COPY_DLLS}
+                               -Ddst=$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>
+                               -P ${_SCRIPT_COPY_DLLS}
       COMMENT "Copying CUDA OpenCV DLLs"
       VERBATIM)
   endif()
   if(_CUDA_BIN_DIR)
     add_custom_command(TARGET WonsAppleGame_VideoCapture POST_BUILD
       COMMAND ${CMAKE_COMMAND} -Dsrc=${_CUDA_BIN_DIR}
-                                 -Ddst=$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>
-                                 -P ${_SCRIPT_COPY_DLLS}
+                               -Ddst=$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>
+                               -P ${_SCRIPT_COPY_DLLS}
       COMMENT "Copying NVIDIA CUDA runtime DLLs"
       VERBATIM)
   else()
     message(WARNING "CUDA bin folder not found; CUDA DLLs will not be copied.")
   endif()
 endif()
+
+# Copy over model file after building
+add_custom_command(TARGET WonsAppleGame_VideoCapture POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${MODEL_SRC}"
+          "$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>/best.onnx"
+  COMMENT "Copying model/best.onnx to output dir"
+  VERBATIM)
