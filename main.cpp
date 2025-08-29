@@ -16,6 +16,7 @@
 #include <algorithm> // For std::max
 #include <numeric>
 #include <limits>
+#include <deque>
 
 #include <cstdlib> // _putenv
 
@@ -27,6 +28,8 @@ using namespace cv;
 using namespace dnn;
 using namespace cuda;
 
+//#define DEBUG_OPENCV 1
+//#define DEBUG_CUDA 1
 //#define DEBUG_DNN 1
 
 namespace fs = std::filesystem;
@@ -36,18 +39,22 @@ static const char* TB_LOW   = "Low Threshold";
 static const char* TB_HIGH  = "High Threshold";
 static const char* TB_KER   = "Kernel(3/5/7)";
 
-// Model path
-fs::path model = fs::current_path() / "best.onnx";
-const int modelResolution = 1920;
-const float confidence = 0.25f;
-const float intersection = 0.25f;
 
 // Display Modes
 enum modes {
 	DEFAULT,
-	CANNY,
 	APPLES,
+	CANNY,
 	MODES_END
+};
+
+// Model path
+struct model {
+	fs::path modelPath = fs::current_path() / "best.onnx";
+	const int modelResW = 640;
+	const int modelResH = 640;
+	const float confidence = 0.35f;
+	const float intersection = 0.45f;
 };
 
 // Structure that caches available video device information
@@ -779,8 +786,9 @@ static bool ocvBuiltWithcuDNN() {
 
 static void ocvPrintBuildInfo() {
 	string info = getBuildInformation();
+#ifdef DEBUG_OPENCV
 	cout << info << endl;
-
+#endif
 	return;
 }
 
@@ -801,9 +809,11 @@ static void printCUDAReport() {
 		cout << "CUDA query failed: " << e.what() << "\n";
 	}
 
+#ifdef DEBUG_CUDA
 	if (ocvBuiltWithCUDA()) {
 		printCudaDeviceInfo(0);
 	}
+#endif
 }
 
 // Callback function for trackbars to work on canny view.
@@ -861,29 +871,29 @@ void onTrackbarKernel(int pos, void* userdata) {
 	onTrackbarThresholds(0, userdata);
 }
 
-int loadModel(string path, dnn::Net* net, bool diagnostics) {
+int loadModel(string path, dnn::Net* net) {
 
-	if (diagnostics) {
-		// 3.1) Turn on very chatty OpenCV logs (especially helpful for dnn backtrace)
-		cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_VERBOSE);
+#ifdef DEBUG_DNN
+	// 3.1) Turn on very chatty OpenCV logs (especially helpful for dnn backtrace)
+	cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_VERBOSE);
 
-		// 3.2) Optional: disable some dnn memory opts to get clearer shapes in logs
-		_putenv("OPENCV_DNN_DISABLE_MEMORY_OPTIMIZATIONS=1");
-		_putenv("OPENCV_LOG_LEVEL=VERBOSE");
+	// 3.2) Optional: disable some dnn memory opts to get clearer shapes in logs
+	_putenv("OPENCV_DNN_DISABLE_MEMORY_OPTIMIZATIONS=1");
+	_putenv("OPENCV_LOG_LEVEL=VERBOSE");
 
-		// 3.3) Report model file size
-		const std::string onnxPath = "best.onnx";  // <-- keep your existing relative/absolute path here
-		try {
-			if (fs::exists(onnxPath)) {
-				auto sz = fs::file_size(onnxPath);
-				std::cout << "[DNN] best.onnx size: " << humanBytes(sz) << "\n";
-			} else {
-				std::cout << "[DNN] ERROR: File not found: " << onnxPath << "\n";
-			}
-		} catch (const std::exception& e) {
-			std::cout << "[DNN] Could not stat file size: " << e.what() << "\n";
+	// 3.3) Report model file size
+	const std::string onnxPath = "best.onnx";  // <-- keep your existing relative/absolute path here
+	try {
+		if (fs::exists(onnxPath)) {
+			auto sz = fs::file_size(onnxPath);
+			std::cout << "[DNN] best.onnx size: " << humanBytes(sz) << "\n";
+		} else {
+			std::cout << "[DNN] ERROR: File not found: " << onnxPath << "\n";
 		}
+	} catch (const std::exception& e) {
+		std::cout << "[DNN] Could not stat file size: " << e.what() << "\n";
 	}
+#endif
 
 	// 3.4) Load the model
 	try {
@@ -894,14 +904,36 @@ int loadModel(string path, dnn::Net* net, bool diagnostics) {
 		throw; // bail early — nothing else to do
 	}
 
-	if (diagnostics) {
-		// 3.5) Print a compact summary of the network as OpenCV sees it
-		printNetSummary(*net);
+#ifdef DEBUG_DNN
+	// 3.5) Print a compact summary of the network as OpenCV sees it
+	printNetSummary(*net);
 
-		// 3.6) Probe shapes (best-effort; safe if it throws)
-		probeLayerShapes(*net);
-	}
+	// 3.6) Probe shapes (best-effort; safe if it throws)
+	probeLayerShapes(*net);
+#endif
 }
+
+// ---- draw overlay (top-left) ----
+auto drawLabel = [](cv::Mat& img, const std::string& text, cv::Point org) {
+	int font = cv::FONT_HERSHEY_SIMPLEX;
+	double scale = 0.6;
+	int thickness = 2;
+
+	// measure text
+	int baseline = 0;
+	cv::Size sz = cv::getTextSize(text, font, scale, thickness, &baseline);
+	baseline += 2;
+
+	// background box for readability
+	cv::rectangle(img,
+				org + cv::Point(0, baseline),
+				org + cv::Point(sz.width, -sz.height),
+				cv::Scalar(0, 0, 0),  // black box
+				cv::FILLED);
+
+	// text (slightly inset)
+	cv::putText(img, text, org, font, scale, cv::Scalar(0, 255, 0), thickness, cv::LINE_AA);
+};
 
 int main() {
 
@@ -953,16 +985,102 @@ int main() {
 
 	bool cannyUIReady = false;
 	CannyUIContext ctx { &gray_frame, &canny_frame, &lowThreshold, &highThreshold, &kernelIndex, &kernelSize, WIN_NAME};
-
-	bool modelReady = false;
 	dnn::Net net;
-
+	deque<double> frame_times;
+	const size_t FPS_WINDOW = 60;  // average over last 60 frames
+	double frameTime;
+	double avg_ms;
+	double avg_fps;
+	double inst_fps;
+	bool firstFrame = true;
+	double minFPS = 100;
+	model apples;
 	
-	cout << "Model Path: " << model.string() << "\n";
+	cout << "Model Path: " << apples.modelPath.string() << "\n";
+
+	// Load the model here to avoid freezing when loading.
+	int ret = loadModel(apples.modelPath.string(), &net);
+
+	// If built with cuda/cudnn
+	if ( ocvBuiltWithCUDA() && ocvBuiltWithcuDNN() ) {
+		cout << "Using DNN GPU\n";
+		net.setPreferableBackend(dnn::DNN_BACKEND_CUDA);
+		net.setPreferableTarget(dnn::DNN_TARGET_CUDA_FP16);
+	} else {
+		cout << "Using DNN CPU\n";
+		net.setPreferableBackend(dnn::DNN_BACKEND_OPENCV);
+		net.setPreferableTarget(dnn::DNN_TARGET_CPU);
+	}
+
+	// We need to capture atleast one frame so we can warm up the model
+	if (!cap.read(frame) || frame.empty()) {
+		cerr << "Error grabbing frame from video device!\n";
+		return 1;
+	}
+
+	// Reshape the frame so that it will fit in the model.
+	cv::Mat out;
+	float scale = 1.f; int dx = 0, dy = 0;
+	cv::Mat input = letterbox_reshape(frame, apples.modelResW, apples.modelResH, scale, dx, dy);
+	cv::Mat blob = cv::dnn::blobFromImage(
+		input, 1.0/255.0, cv::Size(apples.modelResW, apples.modelResH),
+		cv::Scalar(), /*swapRB=*/true, /*crop=*/false
+	);
+	printBlobInfo(blob, "[DNN] Input");
+
+	net.setInput(blob);
+	try {
+		out = net.forward();
+
+		debugAnalyzeOut(out, apples.modelResW, apples.modelResH, apples.confidence);
+
+		// Log output blob shapes
+		printBlobInfo(out, "[DNN] Output");
+	} catch (const Exception& e) {
+		cerr << "\n[DNN] forward() CRASH/ERROR\n";
+		cerr << "  err : " << e.err  << "\n";
+		cerr << "  func: " << e.func << "\n";
+		cerr << "  msg : " << e.msg  << "\n";
+
+		// Dump summary again (sometimes layer state gets clearer after setInput)
+		cerr << "\n[DNN] Net summary after setInput (for context):\n";
+		printNetSummary(net);
+
+		cerr << "\n[DNN] If msg mentions shape mismatch, check the first conv/input layer above.\n";
+		throw; // rethrow so your outer error handling can catch/log it as well
+	}
+	vector<Detection> dets = parseDetections(out, apples.confidence, apples.intersection, apples.modelResW, frame.cols, frame.rows, scale, dx, dy);
+
+	// So we can calculate the frame time/fps
+	TickMeter tm; 
+	tm.start();
 
 	for(;;) {
 
 		if(!cap.read(frame) || frame.empty()) break;
+
+		tm.stop();
+		frameTime = tm.getTimeMilli();
+
+		frame_times.push_back(frameTime);
+		if(frame_times.size() > FPS_WINDOW) frame_times.pop_front();
+
+		// Average ms over window -> average FPS
+		avg_ms = std::accumulate(frame_times.begin(), frame_times.end(), 0.0) / frame_times.size();
+		avg_fps = (avg_ms > 0.0) ? (1000.0 / avg_ms) : 0.0;
+
+		// Optional: also compute instantaneous FPS for reference
+		inst_fps = (frameTime > 0.0) ? (1000.0 / frameTime) : 0.0;
+
+		if (!firstFrame) {
+			// We want to skip the first frame for now, because it is having to load in the model.
+			minFPS = std::min(minFPS, inst_fps);
+		} else {
+			firstFrame = false;
+		}
+
+		tm.reset();
+		tm.start();
 
 		// Mode has changed
 		if (mode != prevMode) {
@@ -977,31 +1095,21 @@ int main() {
 				// Initialize maxes based on current kernel and render once
 				onTrackbarKernel(kernelIndex, &ctx);
 				cannyUIReady = true;
-			} else if ( mode == APPLES && !modelReady ) {
-
-				int ret = loadModel(model.string(), &net, true);
-
-				// If built with cuda/cudnn
-				if ( ocvBuiltWithCUDA() && ocvBuiltWithcuDNN() ) {
-					cout << "Using DNN GPU\n";
-					net.setPreferableBackend(dnn::DNN_BACKEND_CUDA);
-					net.setPreferableTarget(dnn::DNN_TARGET_CUDA_FP16);
-				} else {
-					cout << "Using DNN CPU\n";
-					net.setPreferableBackend(dnn::DNN_BACKEND_OPENCV);
-					net.setPreferableTarget(dnn::DNN_TARGET_CPU);
-				}
-
-				modelReady = true;
-
 			}
 			prevMode = mode;
 		}
+
+		// Compose your status line
+		char buf[128];
+		std::snprintf(buf, sizeof(buf), "FrameTime: %.1f ms | FPS avg: %.1f (inst: %.1f) (min: %.1f)",
+					frameTime, avg_fps, inst_fps, minFPS);
 
 		// Display switch
 		// Displays regular frame or canny depending on mode value.
 		switch (mode) {
 			case DEFAULT: // default
+				// Draw at (10, 25). Adjust Y if you stack multiple lines.
+				drawLabel(frame, buf, {10, 25});
 				imshow(WIN_NAME, frame);
 				break;
 			case CANNY: // canny
@@ -1009,69 +1117,60 @@ int main() {
 				cvtColor(frame, gray_frame, COLOR_BGR2GRAY);
 				blur(gray_frame, canny_frame, Size(3, 3));
 				Canny(canny_frame, canny_frame, lowThreshold, highThreshold, kernelSize);
+				// Draw at (10, 25). Adjust Y if you stack multiple lines.
+				drawLabel(*(ctx.canny), buf, {10, 25});
 
 				// Generate and display the canny view
 				onTrackbarThresholds(0, &ctx);
 				break;
 			case APPLES: // Apple detection
-				/*
-				float scale; int dx, dy;
-				cv::Mat inp = letterbox(frame, modelResolution, scale, dx, dy);
-				cv::Mat blob = cv::dnn::blobFromImage(inp, 1.0/255.0, cv::Size(modelResolution, modelResolution), cv::Scalar(), true, false);
-				*/
-				cv::Mat out;
-
-				// Reshape the frame so that it will fit in the model.
-				// Model expects 1920x1920
-				constexpr int MODEL_W = 960;
-				constexpr int MODEL_H = 960;
 
 				float scale = 1.f; int dx = 0, dy = 0;
-				cv::Mat input = letterbox_reshape(frame, MODEL_W, MODEL_H, scale, dx, dy);
+				input = letterbox_reshape(frame, apples.modelResW, apples.modelResH, scale, dx, dy);
 
-				cv::Mat blob = cv::dnn::blobFromImage(
-					input, 1.0/255.0, cv::Size(MODEL_W, MODEL_H),
+				blob = cv::dnn::blobFromImage(
+					input, 1.0/255.0, cv::Size(apples.modelResW, apples.modelResH),
 					cv::Scalar(), /*swapRB=*/true, /*crop=*/false
 				);
 
 				printBlobInfo(blob, "[DNN] Input");
 
-				//cout << "[DNN] setInput(...)\n";
+				// Pass the blob into the net input for processing
 				net.setInput(blob);
 
 				try {
-					//cout << "[DNN] forward() starting...\n";
-					TickMeter tm; tm.start();
+					// Process the blob
 					out = net.forward();
-					tm.stop();
-					cout << "[DNN] forward() OK in " << tm.getTimeMilli() << " ms\n";
 
 					// Analyze the output from net.forward()
-					debugAnalyzeOut(out, /*modelW*/1920, /*modelW*/1920, confidence);
+					debugAnalyzeOut(out, apples.modelResW, apples.modelResH, apples.confidence);
 
 					// Log output blob shapes
 					printBlobInfo(out, "[DNN] Output");
 				} catch (const Exception& e) {
-					std::cerr << "\n[DNN] forward() CRASH/ERROR\n";
-					std::cerr << "  err : " << e.err  << "\n";
-					std::cerr << "  func: " << e.func << "\n";
-					std::cerr << "  msg : " << e.msg  << "\n";
+					cerr << "\n[DNN] forward() CRASH/ERROR\n";
+					cerr << "  err : " << e.err  << "\n";
+					cerr << "  func: " << e.func << "\n";
+					cerr << "  msg : " << e.msg  << "\n";
 
 					// Dump summary again (sometimes layer state gets clearer after setInput)
-					std::cerr << "\n[DNN] Net summary after setInput (for context):\n";
+					cerr << "\n[DNN] Net summary after setInput (for context):\n";
 					printNetSummary(net);
 
-					std::cerr << "\n[DNN] If msg mentions shape mismatch, check the first conv/input layer above.\n";
+					cerr << "\n[DNN] If msg mentions shape mismatch, check the first conv/input layer above.\n";
 					throw; // rethrow so your outer error handling can catch/log it as well
 				}
 				//cv::Mat out = net.forward();
-				auto dets = parseDetections(out, confidence, intersection, modelResolution, frame.cols, frame.rows, scale, dx, dy);
+				dets = parseDetections(out, apples.confidence, apples.intersection, apples.modelResW, frame.cols, frame.rows, scale, dx, dy);
 
-				for (const auto& d : dets) {
+				for (const Detection& d : dets) {
 					cv::rectangle(frame, d.box, {0,255,0}, 2);
 					char buf[64]; std::snprintf(buf, sizeof(buf), "id=%d %.2f", d.class_id, d.score);
 					cv::putText(frame, buf, d.box.tl() + cv::Point(0,-5), cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,255,0}, 2);
 				}
+
+				// Draw at (10, 25). Adjust Y if you stack multiple lines.
+				drawLabel(frame, buf, {10, 25});
 
 				imshow(WIN_NAME, frame);
 				break;
@@ -1079,7 +1178,6 @@ int main() {
 
 		// If recording is active
 		if (rec.active) {
-
 			// Write the current modes frame to the file.
 			// Consider rewriting the display logic to use a shared mat
 			// Doing this would remove the need for these switch cases.
@@ -1097,7 +1195,6 @@ int main() {
 
 			// If save_frames is true periodicaly save a screenshot
 			if ( (recFrame++ % recRate == 0) && rec.save_frames ) {
-
 				// Save the current modes frame
 				// Consider rewriting the display logic to use a shared mat
 				// Doing this would remove the need for these switch cases.
