@@ -1,1266 +1,310 @@
-#include <opencv2/core.hpp>
-#include <opencv2/core/cuda.hpp>
-#include <opencv2/dnn.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
+// main.cpp
+// Startup-only scaffold for WonsAppleGame VideoCapture rebuild.
+// Focus: clean environment probing, device selection, and capture open.
+// Next steps (later): thread classes, CPU/CUDA halves implementing a shared interface.
+
+#include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/logger.hpp>
-
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <fstream>
-#include <string>
-#include <regex>
-#include <vector>
-#include <filesystem>
-#include <algorithm> // For std::max
-#include <numeric>
-#include <limits>
-#include <deque>
-
-#include <cstdlib> // _putenv
-
-#define NOMINMAX
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
-using namespace std;
+// Include CUDA headers guarded; safe even if OpenCV was built w/o CUDA (calls will throw).
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/core/utility.hpp>
+
+#include <cstdio>
+#include <cstdlib>
+#include <regex>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <algorithm>
+#include <filesystem>
+
+#include "video_capture.hpp"
+#include "video_display.hpp"
+#include "apple_detection.hpp"
+#include "utils.hpp"
+
+using std::cerr;
+using std::cout;
+using std::endl;
+using std::exception;
+using std::getline;
+using std::regex;
+using std::smatch;
+using std::string;
+using std::to_string;
+using std::vector;
+
 using namespace cv;
-using namespace dnn;
-using namespace cuda;
 
-//#define DEBUG_OPENCV 1
-//#define DEBUG_CUDA 1
-//#define DEBUG_DNN 1
+static std::filesystem::path exe_dir() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::filesystem::path p = (n ? std::filesystem::path(buf) : std::filesystem::path());
+    return p.parent_path();
+#else
+    // Fallback: current_path; you can improve this for Linux/macOS if needed
+    return std::filesystem::current_path();
+#endif
+}
 
-namespace fs = std::filesystem;
+// ---------- Small data types ----------
 
-// Trackbar names (keep consistent)
-static const char* TB_LOW   = "Low Threshold";
-static const char* TB_HIGH  = "High Threshold";
-static const char* TB_KER   = "Kernel(3/5/7)";
-
-
-// Display Modes
-enum modes {
-	DEFAULT,
-	APPLES,
-	CANNY,
-	MODES_END
-};
-
-// Model path
-struct model {
-	fs::path modelPath = fs::current_path() / "best.onnx";
-	const int modelResW = 640;
-	const int modelResH = 640;
-	const float confidence = 0.35f;
-	const float intersection = 0.45f;
-};
-
-// Structure that caches available video device information
 struct VideoDevice {
-	int index;
-	string name;
+	int indexInList = -1;   // index within our enumerated video devices
+	string name;            // display name reported by FFmpeg/DirectShow
 };
 
-// Used to store the Canny Parameters
-struct CannyUIContext {
-	Mat* gray;				// Gray Frame
-	Mat* canny;				// Canny Frame
-	int* lowThreshold;
-	int* highThreshold;
-	int* kernelIndex;
-	int* kernel;
-	const char* window;		// Window Name
+enum class ComputeBackend { CPU = 0, CUDA = 1 };
+
+struct Environment {
+	string        ocvVersion;
+	bool          builtWithCUDA   = false;
+	bool          builtWithcuDNN  = false;
+	int           cudaDeviceCount = 0;  // runtime-visible device count (0 if CPU)
+	ComputeBackend backend        = ComputeBackend::CPU;
+	int           selectedCamera  = -1;
 };
 
-// Generates a timestamp for used in file creation
-static std::string timestamp()
-{
-	using clock = std::chrono::system_clock;
-	auto now = clock::now();
+// ---------- Forward decls ----------
+static void   printCUDAReport(Environment& env);
+static void   ocvPrintBuildInfo();
+static bool   ocvBuiltWithCUDA_heuristic();
+static bool   ocvBuiltWithcuDNN_heuristic();
 
-	// Split into whole seconds since epoch and fractional milliseconds
-	auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
-	auto sec_since_epoch = std::chrono::duration_cast<std::chrono::seconds>(ms_since_epoch);
+// ---------- ENTRY ----------
+int main() {
+	// Make OpenCV logger quieter (optional).
+	cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_WARNING);
 
-	// Milliseconds = remainder of division
-	auto ms = ms_since_epoch - sec_since_epoch;
+	// Temporary Debug:
+	//cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_INFO);
+	// Windows:
+	//_putenv_s("OPENCV_LOG_LEVEL", "INFO");
 
-	// Convert seconds-since-epoch to calendar time
-	std::time_t t = sec_since_epoch.count();
-	tm tstamp{};
+	cv::setNumThreads(1); // avoid CPU oversubscription during CUDA
+
+	Environment env{};
+	env.ocvVersion = CV_VERSION;
+
+	printCUDAReport(env);
+	ocvPrintBuildInfo(); // gated by DEBUG_OPENCV inside implementation
+
+	// Decide backend: prefer CUDA only if (builtWithCUDA && cudaDeviceCount > 0)
+	env.backend = (env.builtWithCUDA && env.cudaDeviceCount > 0)
+				? ComputeBackend::CUDA
+				: ComputeBackend::CPU;
+
+	cout << "\nSelected backend: "
+		<< (env.backend == ComputeBackend::CUDA ? "CUDA" : "CPU")
+		<< "\n";
+
+	// ---- Configure the video_capture wrapper ----
+	video_capture cam;
+
+	// Let the camera class handle selection UI
+	int camIndex = cam.selectVideoDevice();
+	if (camIndex < 0) {
+		std::cerr << "No valid device selected. Exiting.\n";
+		return -1;
+	}
+	env.selectedCamera = camIndex;
+
+	cam.set_camera_index(env.selectedCamera);
+	cam.set_backend(env.backend == ComputeBackend::CUDA
+						? video_capture::Backend::CUDA
+						: video_capture::Backend::CPU);
+
+	// Request 1080p60, but let the class search smartly and verify:
+	auto info = cam.negotiate_auto(/*target_w=*/1920, /*target_h=*/1080,
+								/*min_fps=*/59.0,
+								/*prefer_mjpg=*/true, /*measure_ms=*/1200);
+	double fps_final = (info.fps_measured > 0.0) ? info.fps_measured : info.fps_reported;
+	std::cout << "Selected: " << info.width << "x" << info.height
+			<< " ~" << fps_final << " fps"
 	#ifdef _WIN32
-	localtime_s(&tstamp, &t);
-	#else
-	localtime_r(&t, &tstamp);
+			<< " via " << (cam.opened_backend()==video_capture::CapBackend::MSMF ? "MSMF" : "DSHOW")
 	#endif
-
-	// Format: YYYYmmdd_HHMMSS_mmm
-	std::ostringstream oss;
-	oss << std::put_time(&tstamp, "%Y%m%d_%H%M%S")
-		<< '_' << std::setw(3) << std::setfill('0') << ms.count();
-
-	return oss.str();
-}
-
-// Struct for the recorder
-// Used to start/stop mp4/avi recording.
-struct Recorder {
-	VideoWriter writer;
-	bool active = false;
-	bool save_frames = false;
-	fs::path out_path;
-
-	// Try MP4 first; fall back to AVI if needed
-	bool start(int width, int height, double fps, const fs::path& outdir, int mode)
-	{
-		if (active) return true;
-
-		// If the frame lacks "rgb" we have to save it without color.
-		bool isColor = true;
-
-		// Switch incase we have future modes that use black/white output.
-		switch (mode) {
-			case CANNY:
-				isColor = false;
-				break;
-		}
-
-		// Defining the output types
-		int fourcc_mp4v = VideoWriter::fourcc('m','p','4','v');
-		int fourcc_xvid = VideoWriter::fourcc('X','V','I','D');
-
-		// Try to open an mp4 writer
-		out_path = outdir / ("recording_" + timestamp() + ".mp4");
-		bool ok = writer.open(out_path.string(), fourcc_mp4v, (fps > 0 ? fps : 30.0),
-			Size(width, height), isColor);
-
-		// If for some reason that fails, try an AVI format.
-		if (!ok) {
-			// Fallback to AVI/XVID
-			out_path = outdir / ("recording_" + timestamp() + ".avi");
-			ok = writer.open(out_path.string(), fourcc_xvid, (fps > 0 ? fps : 30.0),
-				Size(width, height), isColor);
-		}
-
-		// If all else fails, we abandon this attempt and log an error
-		if (!ok) {
-			cerr << "Failed to open VideoWriter for recording.\n";
-			return false;
-		}
-
-		// We have a successful connection, and will output the output path.
-		active = true;
-		cout << "Recording started: " << out_path.string() << "\n";
-		return true;
-	}
-
-	// Write the provided frame to the file.
-	void write(const Mat& frame)
-	{
-		// Make sure we are still recording, and the frame is not empty
-		if (active && !frame.empty()) {
-			writer.write(frame);
-		}
-	}
-
-	// End the recoirding
-	void stop()
-	{
-		// Sanity check
-		if (active) {
-			// Close out the video writer
-			writer.release();
-
-			// Reset flags for the next recording.
-			active = false;
-			save_frames = false;
-
-			// Output the recording stopped, and the file path.
-			cout << "Recording stopped: " << out_path.string() << "\n";
-		}
-	}
-};
-
-struct Detection {
-	cv::Rect box;
-	float score;
-	int class_id;
-};
-
-// Start Adding helper functions to help debug my model discrepancy
-static std::string humanBytes(uintmax_t b) {
-	std::ostringstream oss;
-	oss << b << " bytes (" << std::fixed << std::setprecision(2) << (b / (1024.0 * 1024.0)) << " MB)";
-	return oss.str();
-}
-
-static std::string matShapeToStr(const cv::dnn::MatShape& s) {
-	std::ostringstream oss; oss << "[";
-	for (size_t i = 0; i < s.size(); ++i) { oss << s[i]; if (i + 1 < s.size()) oss << "x"; }
-	oss << "]";
-	return oss.str();
-}
-
-static void printBlobInfo(const cv::Mat& blob, const std::string& label) {
-#if DEBUG_DNN
-	std::cout << label << " blob: dims=" << blob.dims << " shape=[";
-	for (int i = 0; i < blob.dims; ++i) {
-		std::cout << blob.size[i] << (i + 1 < blob.dims ? "x" : "");
-	}
-	std::cout << "], type=" << blob.type() << "\n";
-#endif
-}
-
-static void printNetSummary(cv::dnn::Net& net) {
-#if DEBUG_DNN
-	auto layerNames = net.getLayerNames();
-	std::cout << "\n--- Net summary ---\n";
-	std::cout << "Total layers: " << layerNames.size() << "\n";
-
-	try {
-		// In OpenCV 4.5.5 this is std::vector<int>
-		std::vector<int> outIds = net.getUnconnectedOutLayers();
-		std::vector<std::string> outNames = net.getUnconnectedOutLayersNames();
-
-		std::cout << "Unconnected output layer IDs: ";
-		for (size_t i = 0; i < outIds.size(); ++i) {
-			std::cout << outIds[i] << (i + 1 < outIds.size() ? ", " : "");
-		}
-		std::cout << "\nOutput names: ";
-		for (size_t i = 0; i < outNames.size(); ++i) {
-			std::cout << outNames[i] << (i + 1 < outNames.size() ? ", " : "");
-		}
-		std::cout << "\n";
-	} catch (...) {
-		std::cout << "(Could not query unconnected outputs)\n";
-	}
-
-
-	// Per-layer brief
-	for (int idx = 0; idx < (int)layerNames.size(); ++idx) {
-		int layerId = idx + 1; // OpenCV layers are 1-based
-		cv::Ptr<cv::dnn::Layer> L = net.getLayer(layerId);
-		if (!L) continue;
-		std::cout << "  [" << layerId << "] " << (L->type.empty()? "?" : L->type)
-				<< "  name=\"" << (L->name.empty()? layerNames[idx] : L->name) << "\"";
-
-		// Show internal blobs (weights/bias) if present
-		if (!L->blobs.empty()) {
-			std::cout << "  (blobs: " << L->blobs.size() << ")";
-			for (size_t b = 0; b < L->blobs.size(); ++b) {
-				const auto& m = L->blobs[b];
-				std::cout << "  blob" << b << ": dims=" << m.dims << " [";
-				for (int d = 0; d < m.dims; ++d) {
-					std::cout << m.size[d] << (d+1<m.dims?"x":"");
-				}
-				std::cout << "]";
-			}
-		}
-		std::cout << "\n";
-	}
-	std::cout << "--- End summary ---\n\n";
-#endif
-}
-
-// Summarize YOLO-style output [1, C, N]
-static void debugAnalyzeOut(const cv::Mat& out, int modelW, int modelH, float confThresh) {
-#if DEBUG_DNN
-	printBlobInfo(out, "Output blob");
-	if (out.dims != 3 || out.size[0] != 1) {
-		std::cout << "[DNN][WARN] Unexpected output dims (expected [1,C,N]).\n";
-		return;
-	}
-	const int C = out.size[1];
-	const int N = out.size[2];
-	std::cout << "[DNN] Channels C=" << C << " anchors N=" << N << "\n";
-
-	// Per-channel min/max
-	for (int c = 0; c < C; ++c) {
-		const float* pc = out.ptr<float>(0, c);
-		float mn = std::numeric_limits<float>::infinity();
-		float mx = -std::numeric_limits<float>::infinity();
-		for (int i = 0; i < N; ++i) { float v = pc[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
-		std::cout << "  ch[" << c << "] min=" << mn << " max=" << mx << "\n";
-	}
-
-	// Assume last channel is confidence when C==5
-	const int confCh = C - 1;
-	const float* conf = out.ptr<float>(0, confCh);
-
-	// Find top 10 by confidence
-	std::vector<int> idx(N);
-	std::iota(idx.begin(), idx.end(), 0);
-	std::partial_sort(idx.begin(), idx.begin() + std::min(10, N), idx.end(),
-		[&](int a, int b){ return conf[a] > conf[b]; });
-
-	int countOver = 0;
-	for (int i = 0; i < N; ++i) if (conf[i] >= confThresh) ++countOver;
-	std::cout << "[DNN] conf >= " << confThresh << " : " << countOver << " anchors\n";
-
-	std::cout << "[DNN] Top anchors by confidence:\n";
-	for (int k = 0; k < std::min(10, N); ++k) {
-		int i = idx[k];
-		float score = conf[i];
-		std::cout << "  #" << k << " i=" << i << " conf=" << score;
-		if (C >= 4) {
-			float x = out.ptr<float>(0, 0)[i];
-			float y = out.ptr<float>(0, 1)[i];
-			float w = out.ptr<float>(0, 2)[i];
-			float h = out.ptr<float>(0, 3)[i];
-			std::cout << " xywh=(" << x << "," << y << "," << w << "," << h << ")";
-		}
-		std::cout << "\n";
-	}
-#endif
-}
-
-static void probeLayerShapes(cv::dnn::Net& net) {
-	std::vector<cv::dnn::MatShape> candidates = {
-		{1,3,640,640}, {1,3,416,416}, {1,3,320,320}, {1,3,480,640}, {1,3,720,1280}
-	};
-
-	// Prefer a real unconnected output layer id; fallback to last layer name → id
-	int targetLayerId = -1;
-	try {
-		auto outIds = net.getUnconnectedOutLayers(); // std::vector<int>
-		if (!outIds.empty()) targetLayerId = outIds.back();
-	} catch (...) {}
-
-	if (targetLayerId < 0) {
-		auto names = net.getLayerNames();
-		if (!names.empty()) {
-			try { targetLayerId = net.getLayerId(names.back()); } catch (...) {}
-		}
-	}
-	if (targetLayerId < 0) {
-		std::cout << "(probeLayerShapes) No valid target layer id found; skipping probes.\n\n";
-		return;
-	}
-
-	std::cout << "--- Shape propagation probes (best-effort) ---\n";
-	for (const auto& inShape : candidates) {
-		try {
-			std::vector<cv::dnn::MatShape> inShapes, outShapes;
-			net.getLayerShapes(inShape, targetLayerId, inShapes, outShapes);
-			std::cout << "Input " << matShapeToStr(inShape) << " -> inShapes("
-					<< inShapes.size() << "), outShapes(" << outShapes.size() << ")\n";
-			if (!outShapes.empty()) {
-				std::cout << "  Example out shape: " << matShapeToStr(outShapes.back()) << "\n";
-			}
-		} catch (const cv::Exception& e) {
-			std::cout << "Input " << matShapeToStr(inShape) << " -> shape propagation error: "
-					<< e.err << " | " << e.func << " | " << e.msg << "\n";
-		}
-	}
-	std::cout << "--- End shape probes ---\n\n";
-}
-
-// End Adding helper functions to help debug my model discrepancy
-static cv::Mat letterbox_reshape(const cv::Mat& src, int new_w, int new_h,
-                                 float& scale, int& dx, int& dy,
-                                 const cv::Scalar& pad = cv::Scalar(114,114,114))
-{
-    const float r = std::min(new_w / (float)src.cols, new_h / (float)src.rows);
-    const int nw = std::round(src.cols * r), nh = std::round(src.rows * r);
-    scale = r;
-
-    cv::Mat resized; cv::resize(src, resized, cv::Size(nw, nh), 0, 0, cv::INTER_LINEAR);
-    dx = (new_w - nw) / 2;  dy = (new_h - nh) / 2;
-
-    cv::Mat out(new_h, new_w, src.type(), pad);
-    resized.copyTo(out(cv::Rect(dx, dy, nw, nh)));
-    return out;
-}
-
-// Letterbox to square with padding=114 (Ultralytics default)
-static cv::Mat letterbox(const cv::Mat& src, int new_size, float& scale, int& dx, int& dy) {
-	int w = src.cols, h = src.rows;
-	float r = std::min((float)new_size / (float)w, (float)new_size / (float)h);
-	int nw = std::round(w * r), nh = std::round(h * r);
-	cv::Mat resized; 
-	cv::resize(src, resized, cv::Size(nw, nh));
-
-	cv::Mat out(new_size, new_size, src.type(), cv::Scalar(114,114,114));
-	dx = (new_size - nw) / 2;
-	dy = (new_size - nh) / 2;
-	resized.copyTo(out(cv::Rect(dx, dy, nw, nh)));
-	scale = r;
-	return out;
-}
-
-// Parse Ultralytics YOLOv8/11 ONNX outputs (robust to (1,84,N) or (1,N,85))
-// Assumptions:
-//  - First 4 values are xywh (center-based)
-//  - If an "objectness" exists, it's right after xywh (i.e., 5th value). Otherwise, class scores start at 5th.
-//  - Remaining values are class scores (sigmoid-applied in export).
-std::vector<Detection> parseDetections(const cv::Mat& out, float confThresh, float iouThresh, int /*inputSize_unused*/, int imgW, int imgH, float scale, int dx, int dy)
-{
-	std::vector<Detection> dets;
-
-#if DEBUG_DNN
-	std::cout << "[PARSE] enter: confThr=" << confThresh << " iouThr=" << iouThresh
-			<< " img=(" << imgW << "x" << imgH << ") scale=" << scale
-			<< " dx=" << dx << " dy=" << dy << "\n";
-	printBlobInfo(out, "PARSE input");
-#endif
-
-	if (out.dims != 3 || out.size[0] != 1) {
-#if DEBUG_DNN
-		std::cout << "[PARSE][ERR] Unexpected output dims.\n";
-#endif
-		return dets;
-	}
-
-	const int C = out.size[1];
-	const int N = out.size[2];
-	const int confCh = C - 1;
-
-	const float* X = out.ptr<float>(0, 0);
-	const float* Y = (C > 1) ? out.ptr<float>(0, 1) : nullptr;
-	const float* W = (C > 2) ? out.ptr<float>(0, 2) : nullptr;
-	const float* H = (C > 3) ? out.ptr<float>(0, 3) : nullptr;
-	const float* S = out.ptr<float>(0, confCh);
-
-#if DEBUG_DNN
-	int prelim = 0;
-	float maxConf = 0.f; int maxIdx = -1;
-	for (int i = 0; i < N; ++i) {
-		if (S[i] >= confThresh) ++prelim;
-		if (S[i] > maxConf) { maxConf = S[i]; maxIdx = i; }
-	}
-	std::cout << "[PARSE] anchors N=" << N << " C=" << C
-			<< " prelim_pass=" << prelim
-			<< " maxConf=" << maxConf << " @i=" << maxIdx << "\n";
-	if (maxIdx >= 0 && C >= 4) {
-		std::cout << "[PARSE] maxConf xywh=("
-				<< X[maxIdx] << "," << Y[maxIdx] << ","
-				<< W[maxIdx] << "," << H[maxIdx] << ")\n";
-	}
-#endif
-
-	// Example decode for xywh in model-input pixels:
-	for (int i = 0; i < N; ++i) {
-		float conf = S[i];
-		if (conf < confThresh) continue;
-
-		float x = X ? X[i] : 0.f;
-		float y = Y ? Y[i] : 0.f;
-		float w = W ? W[i] : 0.f;
-		float h = H ? H[i] : 0.f;
-
-#if DEBUG_DNN
-		if (dets.size() < 5) {
-			std::cout << "[PARSE] raw[" << i << "] conf=" << conf
-					<< " xywh=(" << x << "," << y << "," << w << "," << h << ")\n";
-		}
-#endif
-		// convert xywh (center) -> corners in letterboxed space
-		float x1 = x - w * 0.5f;
-		float y1 = y - h * 0.5f;
-		float x2 = x + w * 0.5f;
-		float y2 = y + h * 0.5f;
-
-		// undo letterbox back to original frame
-		x1 = (x1 - dx) / scale;
-		y1 = (y1 - dy) / scale;
-		x2 = (x2 - dx) / scale;
-		y2 = (y2 - dy) / scale;
-
-		// clamp
-		x1 = std::clamp(x1, 0.f, (float)imgW - 1);
-		y1 = std::clamp(y1, 0.f, (float)imgH - 1);
-		x2 = std::clamp(x2, 0.f, (float)imgW - 1);
-		y2 = std::clamp(y2, 0.f, (float)imgH - 1);
-
-#if DEBUG_DNN
-		if (dets.size() < 5) {
-			std::cout << "        map -> xyxy=(" << x1 << "," << y1 << "," << x2 << "," << y2 << ")\n";
-		}
-#endif
-		Detection d;
-		d.class_id = 0;      // single-class apple; adjust if you have more classes
-		d.score    = conf;
-		d.box      = cv::Rect2f(cv::Point2f(x1, y1), cv::Point2f(x2, y2));
-		dets.push_back(d);
-	}
-
-#if DEBUG_DNN
-	std::cout << "[PARSE] produced " << dets.size() << " raw boxes before NMS\n";
-#endif
-
-	// (your existing NMS here)
-	// After NMS, optionally print the first few:
-#if DEBUG_DNN
-	// Suppose result vector is named 'finals'; else just use 'dets' if you do in-place NMS.
-	const auto& finals = dets; // replace if different
-	for (size_t k = 0; k < finals.size() && k < 5; ++k) {
-		const auto& b = finals[k];
-		std::cout << "[PARSE] keep[" << k << "] class=" << b.class_id
-				<< " conf=" << b.score
-				<< " rect=" << b.box << "\n";
-	}
-	std::cout << "[PARSE] exit\n";
-#endif
-	return dets;
-}
-
-// Returns the path to the output directory.
-// For now this is hard coded to the directory the executable is executed in + /output.
-static fs::path outputDirectory() {
-	// Build the filepath string
-	fs::path out = fs::current_path() / "output";
-	error_code ec;
-	// Check if the path exists
-	if (!fs::exists(out, ec)) {
-		// If the path did not exist, create the directory
-		fs::create_directories(out, ec);
-		if (ec) {
-			cerr << "Failed to create output dir: " << out << " (" << ec.message() << " )\n";
-		}
-	}
-	// Return the path
-	return out;
-}
-
-// Generates a recording directory
-static fs::path recordingDirectory() {
-	// Build the filepath string
-	fs::path out = outputDirectory() / ("recording_" + timestamp());
-	error_code ec;
-	// Check if the path exists
-	if (!fs::exists(out, ec)) {
-		// If the path did not exist create the directory
-		fs::create_directories(out, ec);
-		if (ec) {
-			cerr << "Failed to create recording dir: " << out << " (" << ec.message() << " )\n";
-		}
-	}
-	// Return the path
-	return out;
-}
-
-// Saves the current frame to the output directory
-static bool saveSnapshot(const Mat& frame, const fs::path& outdir, std::string* outPathStr = nullptr)
-{
-	if (frame.empty()) {
-		cerr << "Snapshot failed: empty frame.\n";
-		return false;
-	}
-	fs::path filepath = outdir / ("snapshot_" + timestamp() + ".png");
-	if (imwrite(filepath.string(), frame)) {
-		cout << "Saved snapshot: " << filepath.string() << "\n";
-		if (outPathStr) *outPathStr = filepath.string();
-		return true;
-	} else {
-		cerr << "imwrite failed for: " << filepath.string() << "\n";
-		return false;
-	}
-}
-
-// This will execute a command and capture and return its output.
-string runCommand(const string& cmd) {
-
-// If ran on windows
-#ifdef _WIN32
-
-	// Redirect STDERR into STDOUT for the command.
-	string full = cmd + " 2>&1";
-
-	FILE* pipe = _popen(full.c_str(), "r");
-
-	if (!pipe) {
-		cerr << "Unable to open command pipe.\n";
-		return {};
-	}
-
-	string output;
-
-	char buffer[4096];
-	while (fgets(buffer, sizeof(buffer), pipe)) {
-		output += buffer;
-	}
-
-	_pclose(pipe);
-	return output;
-
-#else
-
-	cerr << "OS unsupported!\n"
-
-#endif
-
-}
-
-vector<VideoDevice> fetchVideoDevices() {
-
-	vector<VideoDevice> deviceList;
-
-#ifdef _WIN32
-
-	// FFmpeg command to list DirectShow devices
-	const string cmd = "ffmpeg -hide_banner -f dshow -list_devices true -i dummy";
-
-	const string result = runCommand(cmd);
-	if (result.empty()) {
-		cerr << "FFmpeg output empty\n";
-		return deviceList;
-	}
-
-	regex quoted_name_re(R"raw("([^"]+)")raw");
-
-	int deviceLineCounter = 0;
-
-	// Parse the output
-	size_t start = 0;
-	while (start < result.size()) {
-
-		size_t end = result.find('\n', start);
-
-		if (end == string::npos) {
-			end = result.size();
-		}
-
-		string line = result.substr(start, end - start);
-		string lower = line;
-
-		// Convert the line to lowercase
-		for (char& c : lower) c = (char)tolower((unsigned char)c);
-
-		//cout << "Line: " << lower << "\n";
-
-		smatch m;
-		if (regex_search(line, m, quoted_name_re)) {
-
-			string deviceName = m[1].str();
-
-			// If this is a video device
-			if (lower.find("video") != string::npos) {
-
-				// Add the device and its index to the vector
-				deviceList.push_back(VideoDevice{ deviceLineCounter, deviceName});
-
-				//cout << "Index: " << deviceLineCounter << " Name: " << deviceName << "\n";
-
-				deviceLineCounter++;
-
-			} else if (lower.find("audio") != string::npos) {
-
-				// This is an audio device, we should increment the deviceLineCounter
-				deviceLineCounter++;
-
-			}
-
-		}
-
-		start = end + (end < result.size() ? 1 : 0);
-
-	}
-
-#else
-
-	cerr << "OS unsupported!\n"
-
-#endif
-
-	return deviceList;
-
-}
-
-void printOptions(vector<VideoDevice> deviceList) {
-	for (const VideoDevice& device : deviceList) {
-		cout << "Index " << device.index << ": " << device.name << "\n";
-	}
-}
-
-// Gonna be honest, I got this from Chat GPT
-// The goal is to clear the terminal output
-// But preserve the history.
-void clearOutput() {
-
-#ifdef _WIN32
-
-	HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-	if (h == INVALID_HANDLE_VALUE) return;
-
-	CONSOLE_SCREEN_BUFFER_INFO csbi{};
-	if (!GetConsoleScreenBufferInfo(h, &csbi)) return;
-
-	SHORT left   = csbi.srWindow.Left;
-	SHORT top    = csbi.srWindow.Top;
-	SHORT width  = csbi.srWindow.Right  - csbi.srWindow.Left + 1;
-	SHORT height = csbi.srWindow.Bottom - csbi.srWindow.Top  + 1;
-
-	DWORD written = 0;
-	for (SHORT y = 0; y < height; ++y) {
-		COORD pos = { left, static_cast<SHORT>(top + y) };
-		FillConsoleOutputCharacterW(h, L' ', width, pos, &written);
-		FillConsoleOutputAttribute(h, csbi.wAttributes, width, pos, &written);
-	}
-	SetConsoleCursorPosition(h, { left, top });
-
-#else
-
-	cerr << "OS unsupported!\n"
-
-#endif
-
-}
-
-// Prompt the user to select a device
-static int selectVideoDevice(vector<VideoDevice> deviceList) {
-
-	// Validate that the list contains atleast one entry
-	if (deviceList.size() <= 0) {
-		cerr << "Invalid deviceList size!\n";
+			<< "\n";
+
+	// Start capture thread
+	if (!cam.start_capture()) {
+		std::cerr << "Failed to start capture.\n";
 		return -1;
 	}
 
-	int index = -1;
-	string input;
+	// Apple_detection Pre-Process
 
-	int tries = 0;
-	while ( tries < 3 ) {
+	std::atomic<bool> quit{false};
 
-		cout << "Select a Video Capture Device\n";
+	apple_detection::Env aenv;
+	aenv.backend     = apple_detection::Backend::CUDA; // or CPU
+	aenv.prefer_fp16 = true;
 
-		printOptions(deviceList);
+	apple_detection detector(aenv, /*input_size*/ {480,480});
+	auto model_path = exe_dir() / "apples.onnx";
+	if (!std::filesystem::exists(model_path)) {
+		std::cerr << "ERROR: apples.onnx not found at: " << model_path.string() << "\n";
+		std::cerr << "Place apples.onnx next to the executable, or update the path.\n";
+		return -2;
+	}
+	std::cout << "Using model: " << model_path.string() << "\n";
+	detector.set_model_path(model_path.string());
 
-		cout << "Q - Quit\n";
+	detector.set_conf_threshold(0.25f);
+	detector.set_nms_threshold(0.45f);
 
-		cout << "Enter device Index: ";
+	detector.start();
 
-		cin >> input;
-
-		string lower = input;
-
-		for (char& c : lower) c = (char)tolower((unsigned char) c);
-
-		if ( lower.find("q") != string::npos ) {
-			// The user wishes to quit
-			return -1;
+	std::thread to_detector([&](){
+		using namespace std::chrono_literals;
+		cv::Mat snap;
+		while (!quit.load()) {
+			// Always give detector a consistent CPU frame
+			if (cam.snapshot_gpu_download(snap) || cam.snapshot_cpu(snap)) {
+				if (!snap.empty()) detector.push_cpu(snap);
+			}
+			std::this_thread::sleep_for(2ms);
 		}
+	});
 
+	// ---- Display ----
+	video_display disp;
+	// disp.output_dir = "F:/ComputerScience/WonsAppleGame/output"; // (optional)
+	disp.set_input_callback([&](int key){
+		switch (key & 0xFF) {
+			case 's': case 'S': disp.saveScreenshot(); break;
+			case 'r': case 'R':
+				if (!disp.isRecording()) disp.startRecording(60);
+				else disp.stopRecording();
+				break;
+			case 27: case 'q': case 'Q': quit.store(true); break;
+		}
+	});
+	disp.start("Wons Mixed Up Apples");
+
+	// Seed a basic diagnostic until detector starts publishing
+	disp.diagnostic = cv::format("%dx%d ~%.1f fps [%s]  —  detector: warming up...",
+								info.width, info.height, info.fps_measured,
+								(env.backend==ComputeBackend::CUDA ? "CUDA" : "CPU"));
+
+	// detector → display
+	std::thread to_display([&](){
+	using namespace std::chrono_literals;
+	while (!quit.load()) {
+		cv::Mat annotated = detector.get_annotated_clone();  // <-- get a fresh copy each loop
+		if (!annotated.empty()) {
+		disp.setFrame(annotated);
+		disp.diagnostic = detector.diagnostic();
+		}
+		std::this_thread::sleep_for(2ms);
+	}
+	});
+
+
+	// ---- Main wait loop ----
+	// Keeps the process from shutting down early.
+	while (!quit.load()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+
+	// ---- Shutdown ----
+	if (to_detector.joinable()) to_detector.join();
+	if (to_display.joinable())  to_display.join();
+
+	disp.stopRecording();
+	disp.stop();
+	detector.stop();
+	cam.stop_capture();
+	return 0;
+}
+
+// ---------- IMPLEMENTATION ----------
+
+static void printCUDAReport(Environment& env) {
+	cout << "OpenCV version: " << env.ocvVersion << "\n";
+
+	// Heuristics: parse build info + safe runtime calls
+	env.builtWithCUDA  = ocvBuiltWithCUDA_heuristic();
+	env.builtWithcuDNN = ocvBuiltWithcuDNN_heuristic();
+
+	cout << "Built with CUDA?  "  << (env.builtWithCUDA  ? "YES" : "NO") << "\n";
+	cout << "Built with cuDNN? " << (env.builtWithcuDNN ? "YES" : "NO") << "\n";
+
+	try {
+		env.cudaDeviceCount = cv::cuda::getCudaEnabledDeviceCount();
+	} catch (const cv::Exception& e) {
+		// Thrown if OpenCV not built with CUDA or CUDA runtime absent
+		cout << "Unable to find cuda enabled device " << e.what() << "\n";
+		env.cudaDeviceCount = 0;
+	}
+	cout << "CUDA devices visible: " << env.cudaDeviceCount << "\n";
+
+	if (env.cudaDeviceCount > 0) {
 		try {
-			index = stoi(input);
-			return index;
-		} catch ( const exception& ) {
-			cerr << "Invalid index!\n";
-			index = -1;
+			cv::cuda::DeviceInfo dev0(0);
+			cout << "Device 0: " << dev0.name()
+				<< ", CC " << dev0.majorVersion() << "." << dev0.minorVersion() << "\n";
+		} catch (const cv::Exception& e) {
+			cout << "CUDA device query failed: " << e.what() << "\n";
 		}
-
-		clearOutput();
-
-		tries++;
-	
-	}
-
-	return index;
-
-}
-
-static bool ocvBuiltWithCUDA() {
-	try {
-		// Fast path: CUDA device count > 0 implies CUDA runtime available AND OpenCV built with CUDA
-		return getCudaEnabledDeviceCount() > 0;
-	} catch (const Exception&) {
-		// Fallback: parse build info text
-		string info = getBuildInformation();
-
-		// Regex: CUDA*YES
-		regex cudaRegex(R"(CUDA\s*:\s*YES)", regex_constants::icase);
-
-		return regex_search(info, cudaRegex);
-	}
-}
-
-static bool ocvBuiltWithcuDNN() {
-	string info = getBuildInformation();
-
-	// Regex: CUDNN*YES
-	regex cudnnRegex(R"(CUDNN\s*:\s*YES)", regex_constants::icase);
-
-	return regex_search(info, cudnnRegex);
-}
-
-static void ocvPrintBuildInfo() {
-	string info = getBuildInformation();
-#ifdef DEBUG_OPENCV
-	cout << info << endl;
-#endif
-	return;
-}
-
-static void printCUDAReport() {
-	cout << "OpenCV version: " << CV_VERSION << "\n";
-	cout << "Built with CUDA?  " << (ocvBuiltWithCUDA()  ? "YES" : "NO") << "\n";
-	cout << "Built with cuDNN? " << (ocvBuiltWithcuDNN() ? "YES" : "NO") << "\n";
-
-	try {
-		int n = getCudaEnabledDeviceCount();
-		cout << "CUDA devices visible: " << n << "\n";
-		if (n > 0) {
-			DeviceInfo dev0(0);
-			cout << "Device 0: " << dev0.name() << ", CC " << dev0.majorVersion() << "." << dev0.minorVersion() << "\n";
-		}
-	} catch (const Exception& e) {
-		// Thrown if OpenCV isn’t built with CUDA or CUDA runtime not present
-		cout << "CUDA query failed: " << e.what() << "\n";
 	}
 
 #ifdef DEBUG_CUDA
-	if (ocvBuiltWithCUDA()) {
-		printCudaDeviceInfo(0);
+	// Optional: print full device info for device 0
+	if (env.cudaDeviceCount > 0) {
+		try {
+			cv::cuda::printShortCudaDeviceInfo(0);
+		} catch (const cv::Exception& e) {
+			cout << "printShortCudaDeviceInfo failed: " << e.what() << "\n";
+		}
 	}
 #endif
 }
 
-// Callback function for trackbars to work on canny view.
-void onTrackbarThresholds(int pos, void* userData) {
-	auto* ctx = static_cast<CannyUIContext*>(userData);
-	if (!ctx || !ctx->gray || !ctx->canny) return;
-	if (ctx->gray->empty()) return;
-
-	if (*(ctx->highThreshold) < *(ctx->lowThreshold)) *(ctx->highThreshold) = *(ctx->lowThreshold);
-
-	Canny(*(ctx->gray), *(ctx->canny), *(ctx->lowThreshold), *(ctx->highThreshold), *(ctx->kernel));
-	imshow(ctx->window, *(ctx->canny));
-}
-
-// Kernel slider moved: remap and adjust threshold maxes
-void onTrackbarKernel(int pos, void* userdata) {
-	auto* ctx = static_cast<CannyUIContext*>(userdata);
-	if (!ctx) return;
-
-	// Decide new max based on kernel size.
-	// (Heuristic: scale with ksize; adjust to your taste.)
-	// 3 → 255, 5 → 425, 7 → 595
-	int newMax;
-
-	switch (*(ctx->kernelIndex)) {
-		case 0:
-			newMax = 255;
-			*(ctx->kernel) = 3;
-			break;
-		case 1:
-			newMax = 4095;
-			*(ctx->kernel) = 5;
-			break;
-		case 2:
-			newMax = 35565;
-			*(ctx->kernel) = 7;
-			break;
-		default:
-			cerr << "Error with kernel size!\n";
-			return;
-	}
-
-	// Update trackbar ranges dynamically
-	setTrackbarMax(TB_LOW,  ctx->window, newMax);
-	setTrackbarMax(TB_HIGH, ctx->window, newMax);
-
-	// Clamp current values to the new max
-	if (*(ctx->lowThreshold)  > newMax) *(ctx->lowThreshold)  = newMax;
-	if (*(ctx->highThreshold) > newMax) *(ctx->highThreshold) = newMax;
-
-	setTrackbarPos(TB_LOW,  ctx->window, *(ctx->lowThreshold));
-	setTrackbarPos(TB_HIGH, ctx->window, *(ctx->highThreshold));
-
-	// Recompute with updated settings
-	onTrackbarThresholds(0, userdata);
-}
-
-int loadModel(string path, dnn::Net* net) {
-
-#ifdef DEBUG_DNN
-	// 3.1) Turn on very chatty OpenCV logs (especially helpful for dnn backtrace)
-	cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_VERBOSE);
-
-	// 3.2) Optional: disable some dnn memory opts to get clearer shapes in logs
-	_putenv("OPENCV_DNN_DISABLE_MEMORY_OPTIMIZATIONS=1");
-	_putenv("OPENCV_LOG_LEVEL=VERBOSE");
-
-	// 3.3) Report model file size
-	const std::string onnxPath = "best.onnx";  // <-- keep your existing relative/absolute path here
-	try {
-		if (fs::exists(onnxPath)) {
-			auto sz = fs::file_size(onnxPath);
-			std::cout << "[DNN] best.onnx size: " << humanBytes(sz) << "\n";
-		} else {
-			std::cout << "[DNN] ERROR: File not found: " << onnxPath << "\n";
-		}
-	} catch (const std::exception& e) {
-		std::cout << "[DNN] Could not stat file size: " << e.what() << "\n";
-	}
-#endif
-
-	// 3.4) Load the model
-	try {
-		*net = dnn::readNetFromONNX(path);
-		std::cout << "[DNN] Loaded ONNX model.\n";
-	} catch (const cv::Exception& e) {
-		std::cerr << "[DNN] Failed to readNetFromONNX: " << e.err << " | " << e.func << " | " << e.msg << "\n";
-		throw; // bail early — nothing else to do
-	}
-
-#ifdef DEBUG_DNN
-	// 3.5) Print a compact summary of the network as OpenCV sees it
-	printNetSummary(*net);
-
-	// 3.6) Probe shapes (best-effort; safe if it throws)
-	probeLayerShapes(*net);
+static void ocvPrintBuildInfo() {
+#ifdef DEBUG_OPENCV
+	string info = cv::getBuildInformation();
+	cout << info << endl;
+#else
+	// No-op unless DEBUG_OPENCV is defined
 #endif
 }
 
-// ---- draw overlay (top-left) ----
-auto drawLabel = [](cv::Mat& img, const std::string& text, cv::Point org) {
-	int font = cv::FONT_HERSHEY_SIMPLEX;
-	double scale = 0.6;
-	int thickness = 2;
-
-	// measure text
-	int baseline = 0;
-	cv::Size sz = cv::getTextSize(text, font, scale, thickness, &baseline);
-	baseline += 2;
-
-	// background box for readability
-	cv::rectangle(img,
-				org + cv::Point(0, baseline),
-				org + cv::Point(sz.width, -sz.height),
-				cv::Scalar(0, 0, 0),  // black box
-				cv::FILLED);
-
-	// text (slightly inset)
-	cv::putText(img, text, org, font, scale, cv::Scalar(0, 255, 0), thickness, cv::LINE_AA);
-};
-
-int main() {
-
-	printCUDAReport();
-
-	ocvPrintBuildInfo();
-
-	vector<VideoDevice> deviceList = fetchVideoDevices();
-
-	int index = selectVideoDevice(deviceList);
-
-	if (index < 0) {
-		cerr << "Invalid device Index " << index << "\n";
-		return -1;
-	}
-
-	VideoCapture cap(index, CAP_DSHOW);
-
-	if (!cap.isOpened()) {
-		cerr << "Failed to open device\n";
-		return -1;
-	}
-
-	Recorder rec;
-
-	cap.set(CAP_PROP_FRAME_WIDTH, 1920);
-	cap.set(CAP_PROP_FRAME_HEIGHT, 1080);
-	cap.set(CAP_PROP_FPS, 60);
-
-	bool quit = false;
-
-	Mat frame;
-	Mat gray_frame;
-	Mat canny_frame;
-
-	int lowThreshold = 25;
-	int highThreshold = 25;
-	int kernelIndex = 0;
-	int kernelSize = 3;
-	int mode = 0;
-	int prevMode = -1;
-	fs::path outDir = outputDirectory();
-	fs::path recDir;
-	int recFrame = 0;
-	int recRate = 8;
-
-	const char* WIN_NAME = "Display";
-	namedWindow(WIN_NAME, WINDOW_AUTOSIZE);
-
-	bool cannyUIReady = false;
-	CannyUIContext ctx { &gray_frame, &canny_frame, &lowThreshold, &highThreshold, &kernelIndex, &kernelSize, WIN_NAME};
-	dnn::Net net;
-	deque<double> frame_times;
-	const size_t FPS_WINDOW = 60;  // average over last 60 frames
-	double frameTime;
-	double avg_ms;
-	double avg_fps;
-	double inst_fps;
-	bool firstFrame = true;
-	double minFPS = 100;
-	model apples;
-	
-	cout << "Model Path: " << apples.modelPath.string() << "\n";
-
-	// Load the model here to avoid freezing when loading.
-	int ret = loadModel(apples.modelPath.string(), &net);
-
-	// If built with cuda/cudnn
-	if ( ocvBuiltWithCUDA() && ocvBuiltWithcuDNN() ) {
-		cout << "Using DNN GPU\n";
-		net.setPreferableBackend(dnn::DNN_BACKEND_CUDA);
-		net.setPreferableTarget(dnn::DNN_TARGET_CUDA_FP16);
-	} else {
-		cout << "Using DNN CPU\n";
-		net.setPreferableBackend(dnn::DNN_BACKEND_OPENCV);
-		net.setPreferableTarget(dnn::DNN_TARGET_CPU);
-	}
-
-	// We need to capture atleast one frame so we can warm up the model
-	if (!cap.read(frame) || frame.empty()) {
-		cerr << "Error grabbing frame from video device!\n";
-		return 1;
-	}
-
-	// Reshape the frame so that it will fit in the model.
-	cv::Mat out;
-	float scale = 1.f; int dx = 0, dy = 0;
-	cv::Mat input = letterbox_reshape(frame, apples.modelResW, apples.modelResH, scale, dx, dy);
-	cv::Mat blob = cv::dnn::blobFromImage(
-		input, 1.0/255.0, cv::Size(apples.modelResW, apples.modelResH),
-		cv::Scalar(), /*swapRB=*/true, /*crop=*/false
-	);
-	printBlobInfo(blob, "[DNN] Input");
-
-	net.setInput(blob);
+// Very light heuristics that don’t crash CPU-only builds:
+static bool ocvBuiltWithCUDA_heuristic() {
+	// Parse build info (most reliable).
 	try {
-		out = net.forward();
-
-		debugAnalyzeOut(out, apples.modelResW, apples.modelResH, apples.confidence);
-
-		// Log output blob shapes
-		printBlobInfo(out, "[DNN] Output");
-	} catch (const Exception& e) {
-		cerr << "\n[DNN] forward() CRASH/ERROR\n";
-		cerr << "  err : " << e.err  << "\n";
-		cerr << "  func: " << e.func << "\n";
-		cerr << "  msg : " << e.msg  << "\n";
-
-		// Dump summary again (sometimes layer state gets clearer after setInput)
-		cerr << "\n[DNN] Net summary after setInput (for context):\n";
-		printNetSummary(net);
-
-		cerr << "\n[DNN] If msg mentions shape mismatch, check the first conv/input layer above.\n";
-		throw; // rethrow so your outer error handling can catch/log it as well
+		const string info = cv::getBuildInformation();
+		// OpenCV build info lines typically contain "CUDA: YES/NO"
+		regex cudaRegex(R"(CUDA\s*:\s*YES)", regex::icase);
+		return regex_search(info, cudaRegex);
+	} catch (...) {
+		// ignore
 	}
-	vector<Detection> dets = parseDetections(out, apples.confidence, apples.intersection, apples.modelResW, frame.cols, frame.rows, scale, dx, dy);
-
-	// So we can calculate the frame time/fps
-	TickMeter tm; 
-	tm.start();
-
-	for(;;) {
-
-		if(!cap.read(frame) || frame.empty()) break;
-
-		tm.stop();
-		frameTime = tm.getTimeMilli();
-
-		frame_times.push_back(frameTime);
-		if(frame_times.size() > FPS_WINDOW) frame_times.pop_front();
-
-		// Average ms over window -> average FPS
-		avg_ms = std::accumulate(frame_times.begin(), frame_times.end(), 0.0) / frame_times.size();
-		avg_fps = (avg_ms > 0.0) ? (1000.0 / avg_ms) : 0.0;
-
-		// Optional: also compute instantaneous FPS for reference
-		inst_fps = (frameTime > 0.0) ? (1000.0 / frameTime) : 0.0;
-
-		if (!firstFrame) {
-			// We want to skip the first frame for now, because it is having to load in the model.
-			minFPS = std::min(minFPS, inst_fps);
-		} else {
-			firstFrame = false;
-		}
-
-		tm.reset();
-		tm.start();
-
-		// Mode has changed
-		if (mode != prevMode) {
-			if (mode == CANNY && !cannyUIReady) {
-				// Create trackbars with initial max; these will be updated by kernel callback
-				createTrackbar(TB_LOW,  WIN_NAME, &lowThreshold, 255, onTrackbarThresholds, &ctx);
-				createTrackbar(TB_HIGH, WIN_NAME, &highThreshold, 255, onTrackbarThresholds, &ctx);
-
-				// Kernel slider (0..2). use dedicated callback.
-				createTrackbar(TB_KER, WIN_NAME, &kernelIndex, 2, onTrackbarKernel, &ctx);
-
-				// Initialize maxes based on current kernel and render once
-				onTrackbarKernel(kernelIndex, &ctx);
-				cannyUIReady = true;
-			}
-			prevMode = mode;
-		}
-
-		// Compose your status line
-		char buf[128];
-		std::snprintf(buf, sizeof(buf), "FrameTime: %.1f ms | FPS avg: %.1f (inst: %.1f) (min: %.1f)",
-					frameTime, avg_fps, inst_fps, minFPS);
-
-		// Display switch
-		// Displays regular frame or canny depending on mode value.
-		switch (mode) {
-			case DEFAULT: // default
-				// Draw at (10, 25). Adjust Y if you stack multiple lines.
-				drawLabel(frame, buf, {10, 25});
-				imshow(WIN_NAME, frame);
-				break;
-			case CANNY: // canny
-				// Convert the frame to canny
-				cvtColor(frame, gray_frame, COLOR_BGR2GRAY);
-				blur(gray_frame, canny_frame, Size(3, 3));
-				Canny(canny_frame, canny_frame, lowThreshold, highThreshold, kernelSize);
-				// Draw at (10, 25). Adjust Y if you stack multiple lines.
-				drawLabel(*(ctx.canny), buf, {10, 25});
-
-				// Generate and display the canny view
-				onTrackbarThresholds(0, &ctx);
-				break;
-			case APPLES: // Apple detection
-
-				float scale = 1.f; int dx = 0, dy = 0;
-				input = letterbox_reshape(frame, apples.modelResW, apples.modelResH, scale, dx, dy);
-
-				blob = cv::dnn::blobFromImage(
-					input, 1.0/255.0, cv::Size(apples.modelResW, apples.modelResH),
-					cv::Scalar(), /*swapRB=*/true, /*crop=*/false
-				);
-
-				printBlobInfo(blob, "[DNN] Input");
-
-				// Pass the blob into the net input for processing
-				net.setInput(blob);
-
-				try {
-					// Process the blob
-					out = net.forward();
-
-					// Analyze the output from net.forward()
-					debugAnalyzeOut(out, apples.modelResW, apples.modelResH, apples.confidence);
-
-					// Log output blob shapes
-					printBlobInfo(out, "[DNN] Output");
-				} catch (const Exception& e) {
-					cerr << "\n[DNN] forward() CRASH/ERROR\n";
-					cerr << "  err : " << e.err  << "\n";
-					cerr << "  func: " << e.func << "\n";
-					cerr << "  msg : " << e.msg  << "\n";
-
-					// Dump summary again (sometimes layer state gets clearer after setInput)
-					cerr << "\n[DNN] Net summary after setInput (for context):\n";
-					printNetSummary(net);
-
-					cerr << "\n[DNN] If msg mentions shape mismatch, check the first conv/input layer above.\n";
-					throw; // rethrow so your outer error handling can catch/log it as well
-				}
-				//cv::Mat out = net.forward();
-				dets = parseDetections(out, apples.confidence, apples.intersection, apples.modelResW, frame.cols, frame.rows, scale, dx, dy);
-
-				for (const Detection& d : dets) {
-					cv::rectangle(frame, d.box, {0,255,0}, 2);
-					char buf[64]; std::snprintf(buf, sizeof(buf), "id=%d %.2f", d.class_id, d.score);
-					cv::putText(frame, buf, d.box.tl() + cv::Point(0,-5), cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,255,0}, 2);
-				}
-
-				// Draw at (10, 25). Adjust Y if you stack multiple lines.
-				drawLabel(frame, buf, {10, 25});
-
-				imshow(WIN_NAME, frame);
-				break;
-		}
-
-		// If recording is active
-		if (rec.active) {
-			// Write the current modes frame to the file.
-			// Consider rewriting the display logic to use a shared mat
-			// Doing this would remove the need for these switch cases.
-			switch (mode) {
-				case DEFAULT: // default
-				case APPLES: // Apple Detection
-					// Write the current frame to the file.
-					rec.write(frame);
-					break;
-				case CANNY: // canny
-					// Write the current canny_frame to the file.
-					rec.write(canny_frame);
-					break;
-			}
-
-			// If save_frames is true periodicaly save a screenshot
-			if ( (recFrame++ % recRate == 0) && rec.save_frames ) {
-				// Save the current modes frame
-				// Consider rewriting the display logic to use a shared mat
-				// Doing this would remove the need for these switch cases.
-				switch (mode) {
-				case DEFAULT: // default
-				case APPLES: // Apple Detection
-					// Save the screenshot
-					saveSnapshot(frame, recDir, nullptr);
-					break;
-				case CANNY: // canny
-					// Save the screenshot
-					saveSnapshot(canny_frame, recDir, nullptr);
-					break;
-				}
-
-			}
-
-		}
-
-		// This routine will process any keyboard inputs.
-		int key = waitKey(1);
-		switch (key) {
-			case 27: // "ESC" to quit
-				quit = true;
-				break;
-			case 'M': // Cycle Modes
-			case 'm': // Cycle Modes
-				prevMode = mode++;
-				//mode++;
-				if ( mode >= MODES_END ) {
-					mode = 0;
-				}
-				break;
-			case 'p': // Screenshot
-			case 'P': // Screenshot
-				switch (mode) {
-				case DEFAULT: // default
-				case APPLES: // Apple Detection
-					// Save the screenshot
-					saveSnapshot(frame, recDir, nullptr);
-					break;
-				case CANNY: // canny
-					// Save the screenshot
-					saveSnapshot(canny_frame, recDir, nullptr);
-					break;
-				}
-				break;
-			case 'R': // Recording while Saving frames periodicaly
-				rec.save_frames = true;
-			case 'r': // Regular recording
-				if (rec.active) {
-					rec.stop();
-				} else {
-					int width  = static_cast<int>(cap.get(CAP_PROP_FRAME_WIDTH));
-					int height = static_cast<int>(cap.get(CAP_PROP_FRAME_HEIGHT));
-					double fps = cap.get(CAP_PROP_FPS);
-					if (fps <= 0 || fps > 240) fps = 30.0; // sane default
-					recDir = recordingDirectory();
-					if (!rec.start(width, height, fps, recDir, mode)) {
-						cerr << "Recording could not be started.\n";
-					}
-				}
-
-		}
-		if ( quit ) break;
+	// Fallback: try a harmless runtime call
+	try {
+		(void)cv::cuda::getCudaEnabledDeviceCount();
+		return true;
+	} catch (...) {
+		return false;
 	}
+}
 
-	return 0;
+static bool ocvBuiltWithcuDNN_heuristic() {
+	try {
+		const string info = cv::getBuildInformation();
+		// cuDNN line varies by version; catch common variants
+		// Regex: CUDNN*YES
+		regex cudnnRegex(R"(CUDNN\s*:\s*YES)", regex::icase);
+		return regex_search(info, cudnnRegex);
+	} catch (...) {
+		return false;
+	}
 }

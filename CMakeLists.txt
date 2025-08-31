@@ -25,10 +25,16 @@ endif()
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-add_executable(WonsAppleGame_VideoCapture main.cpp)
+add_executable(WonsAppleGame_VideoCapture
+  main.cpp
+  video_capture.cpp
+  video_display.cpp
+  apple_detection.cpp
+  utils.cpp
+)
 
 # ---- Model asset copy (post-build) ----
-set(MODEL_SRC "${CMAKE_CURRENT_LIST_DIR}/model/best.onnx")
+set(MODEL_SRC "${CMAKE_CURRENT_LIST_DIR}/model/apples.onnx")
 
 # Make the model visible in IDEs (it won't be compiled)
 if(EXISTS "${MODEL_SRC}")
@@ -110,6 +116,6 @@ add_custom_command(TARGET WonsAppleGame_VideoCapture POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${MODEL_SRC}"
-          "$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>/best.onnx"
-  COMMENT "Copying model/best.onnx to output dir"
+          "$<TARGET_FILE_DIR:WonsAppleGame_VideoCapture>/apples.onnx"
+  COMMENT "Copying model/apples.onnx to output dir"
   VERBATIM)
