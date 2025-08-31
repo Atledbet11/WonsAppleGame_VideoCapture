@@ -22,6 +22,8 @@ public:
 	struct Env {
 		Backend backend = Backend::CPU;
 		bool    prefer_fp16 = false;   // used by forward thread for DNN target
+		float   detector_conf = 0.60f;
+		float   detector_nms  = 0.40f;
 	};
 
 	// Item passed from pre-process → forward
@@ -77,8 +79,8 @@ public:
 	void set_model_path(const std::string& p);
 	std::string model_path() const;
 
-	void set_conf_threshold(float t) { conf_thresh_ = t; }
-	void set_nms_threshold(float t)  { nms_thresh_  = t; }
+	void set_conf_threshold(float t) { env_.detector_conf = t; }
+	void set_nms_threshold(float t)  { env_.detector_nms  = t; }
 
 	void set_letterbox(bool on) { letterbox_ = on; }
 
@@ -108,8 +110,6 @@ private:
 	float     scalefactor_ = 1.f / 255.f;     // YOLO-style normalization
 	bool      swapRB_      = true;
 	cv::Scalar mean_       = cv::Scalar();    // (0,0,0)
-	float     conf_thresh_ = 0.25f;
-	float     nms_thresh_  = 0.40f;
 	bool      letterbox_   = true;
 
 	// --- State & sync ---

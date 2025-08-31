@@ -83,11 +83,6 @@ int main() {
 	// Make OpenCV logger quieter (optional).
 	cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_WARNING);
 
-	// Temporary Debug:
-	//cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_INFO);
-	// Windows:
-	//_putenv_s("OPENCV_LOG_LEVEL", "INFO");
-
 	cv::setNumThreads(1); // avoid CPU oversubscription during CUDA
 
 	Environment env{};
@@ -157,8 +152,8 @@ int main() {
 	std::cout << "Using model: " << model_path.string() << "\n";
 	detector.set_model_path(model_path.string());
 
-	detector.set_conf_threshold(0.25f);
-	detector.set_nms_threshold(0.40f);
+	detector.set_conf_threshold(aenv.detector_conf);
+	detector.set_nms_threshold(aenv.detector_nms);
 
 	detector.start();
 
@@ -189,6 +184,19 @@ int main() {
 	});
 	disp.start("Wons Mixed Up Apples");
 
+	// add near where you start display:
+	cv::namedWindow("Detector Controls", cv::WINDOW_NORMAL);
+	int conf_i = int(aenv.detector_conf * 100);  // start from your current values
+	int nms_i  = int(aenv.detector_nms  * 100);
+	cv::createTrackbar("conf x0.01", "Detector Controls", &conf_i, 100, [](int v, void* ud){
+		auto* det = static_cast<apple_detection*>(ud);
+		det->set_conf_threshold((std::max)(1, v) / 100.f);
+	}, &detector);
+	cv::createTrackbar("nms  x0.01", "Detector Controls", &nms_i, 100, [](int v, void* ud){
+		auto* det = static_cast<apple_detection*>(ud);
+		det->set_nms_threshold((std::max)(1, v) / 100.f);
+	}, &detector);
+
 	// Seed a basic diagnostic until detector starts publishing
 	disp.diagnostic = cv::format("%dx%d ~%.1f fps [%s]  —  detector: warming up...",
 								info.width, info.height, info.fps_measured,
@@ -211,6 +219,7 @@ int main() {
 	// ---- Main wait loop ----
 	// Keeps the process from shutting down early.
 	while (!quit.load()) {
+		(void)cv::pollKey();   // pumps events without waiting
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 

@@ -521,7 +521,7 @@ void apple_detection::postprocess_loop_() {
 			float obj = has_obj ? p[4] : 1.0f;
 			float conf = obj * best_s;
 
-			if (conf < conf_thresh_) continue;
+			if (conf < env_.detector_conf) continue;
 
 			// If normalized to [0,1], scale to model-input size first
 			if (w <= 2.0f && h <= 2.0f && x <= 1.5f && y <= 1.5f) {
@@ -562,7 +562,7 @@ void apple_detection::postprocess_loop_() {
 
 		// NMS
 		std::vector<int> keep;
-		cv::dnn::NMSBoxes(boxes, scores, conf_thresh_, nms_thresh_, keep);
+		cv::dnn::NMSBoxes(boxes, scores, env_.detector_conf, env_.detector_nms, keep);
 
 		// Draw
 		for (int idx : keep) {
