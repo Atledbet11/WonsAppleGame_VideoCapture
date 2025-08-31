@@ -239,53 +239,92 @@ void apple_detection::preprocess_loop_() {
 
 		auto t0 = clock_steady::now();
 
+		// --- compute letterbox geometry ---
+		const int inW = input_size_.width;
+		const int inH = input_size_.height;
+
 		cv::Mat original_bgr;
 		cv::Size orig_size;
-		cv::Mat resized_cpu;
+		cv::Mat model_input_bgr;  // the 480x480 (letterboxed) image fed to blob
 
-#ifdef HAVE_OPENCV_CUDAWARPING
+		#ifdef HAVE_OPENCV_CUDAWARPING
 		if (use_gpu) {
-			if (!in_local_gpu.empty()) {
-				in_local_gpu.download(original_bgr);
-				orig_size = original_bgr.size();
-
-				cv::cuda::GpuMat resized_gpu;
-				cv::cuda::resize(in_local_gpu, resized_gpu, input_size_, 0, 0, cv::INTER_LINEAR);
-				resized_gpu.download(resized_cpu);
-			}
+			in_local_gpu.download(original_bgr);
+			orig_size = original_bgr.size();
 		} else
-#endif
+		#endif
 		{
 			original_bgr = in_local_cpu;
 			orig_size    = original_bgr.size();
+		}
 
-			if (!original_bgr.empty() && input_size_ != original_bgr.size()) {
-				cv::resize(original_bgr, resized_cpu, input_size_, 0, 0, cv::INTER_LINEAR);
+		if (original_bgr.empty()) {
+			// publish empty and continue
+			std::lock_guard<std::mutex> lk(mtx_);
+			fwd_item_ = FwdItem{};
+			fwd_ready_ = true;
+			cv_.notify_all();
+			update_diag_pre_(0.0);
+			continue;
+		}
+
+		float scale = 1.f;
+		int pad_x = 0, pad_y = 0;
+
+		if (!letterbox_) {
+			// old behavior: direct resize (may stretch)
+			if (orig_size != input_size_) {
+				cv::resize(original_bgr, model_input_bgr, input_size_, 0, 0, cv::INTER_LINEAR);
 			} else {
-				resized_cpu = original_bgr;
+				model_input_bgr = original_bgr;
 			}
+			scale = static_cast<float>(inW) / std::max(1, orig_size.width); // rough, unused if not letterboxing
+			pad_x = pad_y = 0;
+		} else {
+			// Keep aspect ratio, pad with 114 (YOLO convention)
+			float s = std::min(inW / static_cast<float>(orig_size.width),
+							inH / static_cast<float>(orig_size.height));
+			int newW = std::max(1, static_cast<int>(std::round(orig_size.width  * s)));
+			int newH = std::max(1, static_cast<int>(std::round(orig_size.height * s)));
+
+			cv::Mat resized;
+		#ifdef HAVE_OPENCV_CUDAWARPING
+			if (use_gpu) {
+				cv::cuda::GpuMat gpu_resized;
+				cv::cuda::resize(in_local_gpu, gpu_resized, cv::Size(newW, newH), 0, 0, cv::INTER_LINEAR);
+				gpu_resized.download(resized);
+			} else
+		#endif
+			{
+				cv::resize(original_bgr, resized, cv::Size(newW, newH), 0, 0, cv::INTER_LINEAR);
+			}
+
+			// Pad into a fixed canvas
+			model_input_bgr = cv::Mat(inH, inW, CV_8UC3, cv::Scalar(114,114,114));
+			pad_x = (inW - newW) / 2;
+			pad_y = (inH - newH) / 2;
+			resized.copyTo(model_input_bgr(cv::Rect(pad_x, pad_y, newW, newH)));
+
+			scale = s;
 		}
 
+		// Make the blob from the letterboxed (or resized) image
 		cv::Mat blob;
-		if (!resized_cpu.empty()) {
-			cv::dnn::blobFromImage(
-				resized_cpu,
-				blob,
-				scalefactor_,
-				input_size_,
-				mean_,
-				swapRB_,
-				/*crop*/ false,
-				CV_32F
-			);
-		}
+		cv::dnn::blobFromImage(
+			model_input_bgr, blob,
+			scalefactor_, input_size_, mean_, swapRB_, /*crop*/ false, CV_32F
+		);
 
+		// publish
 		{
 			std::lock_guard<std::mutex> lk(mtx_);
 			fwd_item_.blob         = std::move(blob);
 			fwd_item_.original_bgr = std::move(original_bgr);
 			fwd_item_.orig_size    = orig_size;
 			fwd_item_.seq          = seq_.fetch_add(1, std::memory_order_relaxed);
+			fwd_item_.lb_scale     = scale;
+			fwd_item_.lb_pad_x     = pad_x;
+			fwd_item_.lb_pad_y     = pad_y;
 			fwd_ready_             = true;
 		}
 		cv_.notify_all();
@@ -356,6 +395,11 @@ void apple_detection::forward_loop_() {
 			post_item_.orig_size   = item.orig_size;
 			post_item_.seq         = item.seq;
 			post_ready_            = true;
+
+			// NEW: carry letterbox info
+			post_item_.lb_scale     = item.lb_scale;
+			post_item_.lb_pad_x     = item.lb_pad_x;
+			post_item_.lb_pad_y     = item.lb_pad_y;
 		}
 		cv_.notify_all();
 	}
@@ -454,8 +498,8 @@ void apple_detection::postprocess_loop_() {
 		std::vector<int>       class_ids;
 		boxes.reserve(num_preds); scores.reserve(num_preds); class_ids.reserve(num_preds);
 
-		const float inW = static_cast<float>(input_size_.width);
-		const float inH = static_cast<float>(input_size_.height);
+		const int inW = input_size_.width;
+		const int inH = input_size_.height;
 		const float sx  = item.orig_size.width  / inW;
 		const float sy  = item.orig_size.height / inH;
 
@@ -479,16 +523,27 @@ void apple_detection::postprocess_loop_() {
 
 			if (conf < conf_thresh_) continue;
 
-			// If normalized to [0,1], scale to input size
+			// If normalized to [0,1], scale to model-input size first
 			if (w <= 2.0f && h <= 2.0f && x <= 1.5f && y <= 1.5f) {
 				x *= inW; y *= inH; w *= inW; h *= inH;
 			}
 
-			// Convert center x,y,w,h to top-left box in original image coords
-			float left = (x - 0.5f * w) * sx;
-			float top  = (y - 0.5f * h) * sy;
-			float bw   = w * sx;
-			float bh   = h * sy;
+			// Undo letterbox padding and scale back to original image
+			const float scale = item.lb_scale; // we need these from the same seq
+			const int   px    = item.lb_pad_x;
+			const int   py    = item.lb_pad_y;
+
+			// Model outputs are in the model-input (letterboxed) space.
+			// Convert center -> tl, remove pad, then divide by scale.
+			float cx = (x - px) / scale;
+			float cy = (y - py) / scale;
+			float bw0 = w / scale;
+			float bh0 = h / scale;
+
+			float left = cx - 0.5f * bw0;
+			float top  = cy - 0.5f * bh0;
+			float bw   = bw0;
+			float bh   = bh0;
 
 			cv::Rect rect(
 				static_cast<int>(std::round(left)),

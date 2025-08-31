@@ -26,11 +26,17 @@ public:
 
 	// Item passed from pre-process → forward
 	struct FwdItem {
-		cv::Mat blob;          // NCHW float32 blob ready for net.setInput()
-		cv::Mat original_bgr;  // original frame for overlay (unchanged)
-		cv::Size orig_size{};  // original size (width, height)
-		int64_t  seq = 0;      // sequence id (monotonic)
+		cv::Mat blob;
+		cv::Mat original_bgr;
+		cv::Size orig_size{};
+		int64_t  seq = 0;
+
+		// NEW: letterbox mapping (input->original)
+		float lb_scale = 1.f;  // scale applied to original before padding
+		int   lb_pad_x = 0;    // left padding in model-input coords
+		int   lb_pad_y = 0;    // top  padding in model-input coords
 	};
+
 
 	// Item passed from forward → post-process
 	struct PostItem {
@@ -38,6 +44,11 @@ public:
 		cv::Mat original_bgr;      // original frame
 		cv::Size orig_size{};
 		int64_t  seq = 0;
+
+		// NEW: letterbox info from FwdItem
+		float lb_scale = 1.f;
+		int   lb_pad_x = 0;
+		int   lb_pad_y = 0;
 	};
 
 	explicit apple_detection(const Env& env = {}, cv::Size input_size = {640, 640});
@@ -69,6 +80,8 @@ public:
 	void set_conf_threshold(float t) { conf_thresh_ = t; }
 	void set_nms_threshold(float t)  { nms_thresh_  = t; }
 
+	void set_letterbox(bool on) { letterbox_ = on; }
+
 	// Diagnostics (updated by threads; not displayed here)
 	std::string diagnostic() const;   // e.g., "pre=1.6ms fwd=22.4ms post=2.1ms"
 
@@ -96,7 +109,8 @@ private:
 	bool      swapRB_      = true;
 	cv::Scalar mean_       = cv::Scalar();    // (0,0,0)
 	float     conf_thresh_ = 0.25f;
-	float     nms_thresh_  = 0.45f;
+	float     nms_thresh_  = 0.40f;
+	bool      letterbox_   = true;
 
 	// --- State & sync ---
 	std::atomic<bool> running_{false};

@@ -158,7 +158,7 @@ int main() {
 	detector.set_model_path(model_path.string());
 
 	detector.set_conf_threshold(0.25f);
-	detector.set_nms_threshold(0.45f);
+	detector.set_nms_threshold(0.40f);
 
 	detector.start();
 
