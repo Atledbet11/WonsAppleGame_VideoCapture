@@ -198,9 +198,11 @@ int main() {
 	}, &detector);
 
 	// Seed a basic diagnostic until detector starts publishing
-	disp.diagnostic = cv::format("%dx%d ~%.1f fps [%s]  —  detector: warming up...",
+	disp.diagnostic_line1 = cv::format("%dx%d ~%.1f fps [%s]  —  detector: warming up...",
 								info.width, info.height, info.fps_measured,
 								(env.backend==ComputeBackend::CUDA ? "CUDA" : "CPU"));
+
+	disp.diagnostic_line2 = cv::format("dets=?");
 
 	// detector → display
 	std::thread to_display([&](){
@@ -209,7 +211,8 @@ int main() {
 		cv::Mat annotated = detector.get_annotated_clone();  // <-- get a fresh copy each loop
 		if (!annotated.empty()) {
 		disp.setFrame(annotated);
-		disp.diagnostic = detector.diagnostic();
+		disp.diagnostic_line1 = detector.diagnostic();
+		disp.diagnostic_line2 = detector.diagnostic_2();
 		}
 		std::this_thread::sleep_for(2ms);
 	}

@@ -155,11 +155,12 @@ void video_display::display_loop_(std::string window_name) {
 	int   frames = 0;
 
 	while (running_.load()) {
-		cv::Mat to_show; std::string diag;
+		cv::Mat to_show; std::string diag; std::string diag2;
 		{
 			std::lock_guard<std::mutex> lk(frame_mtx_);
 			if (!frame.empty()) to_show = frame.clone();
-			diag = diagnostic;
+			diag = diagnostic_line1;
+			diag2 = diagnostic_line2;
 		}
 
 		if (!to_show.empty()) {
@@ -180,6 +181,11 @@ void video_display::display_loop_(std::string window_name) {
 
 			if (draw_diag_.load() && !diag.empty()) {
 				cv::putText(to_show, diag, {12, 54},
+							cv::FONT_HERSHEY_SIMPLEX, 0.6, {255,255,255}, 2, cv::LINE_AA);
+			}
+
+			if (draw_diag_2_.load() && !diag2.empty()) {
+				cv::putText(to_show, diag2, {12, 80},
 							cv::FONT_HERSHEY_SIMPLEX, 0.6, {255,255,255}, 2, cv::LINE_AA);
 			}
 

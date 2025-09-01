@@ -11,9 +11,10 @@
 class video_display {
 public:
 	// ---- Public data (as requested) ----
-	cv::Mat frame;                 // latest frame to display (you may write to it)
-	std::string diagnostic;        // text to draw under the FPS label
-	std::string output_dir;        // public output directory; defaults to <exe>/output
+	cv::Mat frame;                       // latest frame to display (you may write to it)
+	std::string diagnostic_line1;        // text to draw under the FPS label
+	std::string diagnostic_line2;        // text to draw under the first line.
+	std::string output_dir;              // public output directory; defaults to <exe>/output
 
 	// ---- Lifecycle ----
 	video_display();
@@ -40,6 +41,7 @@ public:
 	// ---- Optional overlays ----
 	void set_draw_fps(bool enabled) noexcept { draw_fps_.store(enabled); }
 	void set_draw_diag(bool enabled) noexcept { draw_diag_.store(enabled); }
+	void set_draw_diag_2(bool enabled) noexcept { draw_diag_2_.store(enabled); }
 
 	// Safe clones (helpful if you prefer not to touch the public members directly)
 	bool cloneFrame(cv::Mat& dst);
@@ -75,6 +77,7 @@ private:
 	double last_fps_ = 0.0;
 	std::atomic<bool> draw_fps_{true};
 	std::atomic<bool> draw_diag_{true};
+	std::atomic<bool> draw_diag_2_{true};
 
 	// Frame access guard (protects reads/writes to public frame/diagnostic during display copy)
 	std::mutex frame_mtx_;

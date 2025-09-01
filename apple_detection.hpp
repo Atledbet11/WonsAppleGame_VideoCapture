@@ -22,8 +22,8 @@ public:
 	struct Env {
 		Backend backend = Backend::CPU;
 		bool    prefer_fp16 = false;   // used by forward thread for DNN target
-		float   detector_conf = 0.60f;
-		float   detector_nms  = 0.40f;
+		float   detector_conf = 0.70f;
+		float   detector_nms  = 0.70f;
 	};
 
 	// Item passed from pre-process → forward
@@ -86,6 +86,7 @@ public:
 
 	// Diagnostics (updated by threads; not displayed here)
 	std::string diagnostic() const;   // e.g., "pre=1.6ms fwd=22.4ms post=2.1ms"
+	std::string diagnostic_2() const; // e.g., "dets=3"
 
 	// Output for your display bridge (reader usually clones this)
 	cv::Mat annotated;
@@ -102,6 +103,7 @@ private:
 	void update_diag_pre_(double ms);
 	void update_diag_fwd_(double ms);
 	void update_diag_post_(double ms);
+	void update_diag_dets_(int dets);
 	bool load_if_needed_(); // lazy model load inside forward loop
 
 	// --- Config ---
@@ -149,6 +151,9 @@ private:
 	double fwd_ms_  = 0.0;
 	double post_ms_ = 0.0;
 	std::string diag_;
+	mutable std::mutex diag_2_mtx_;
+	int diag_dets_ = 0;
+	std::string diag_2_;
 
 	// Sequencing
 	std::atomic<int64_t> seq_{0};

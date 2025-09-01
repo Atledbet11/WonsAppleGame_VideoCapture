@@ -118,6 +118,11 @@ std::string apple_detection::diagnostic() const {
 	return diag_;
 }
 
+std::string apple_detection::diagnostic_2() const {
+	std::lock_guard<std::mutex> lk(diag_2_mtx_);
+	return diag_2_;
+}
+
 void apple_detection::update_diag_pre_(double ms) {
 	std::lock_guard<std::mutex> lk(diag_mtx_);
 	pre_ms_ = ms;
@@ -149,6 +154,15 @@ void apple_detection::update_diag_post_(double ms) {
 		<< "fwd="  << fwd_ms_  << "ms "
 		<< "post=" << post_ms_ << "ms";
 	diag_ = oss.str();
+}
+
+void apple_detection::update_diag_dets_(int dets) {
+	std::lock_guard<std::mutex> lk(diag_2_mtx_);
+	diag_dets_ = dets;
+	std::ostringstream oss;
+	oss << std::fixed << std::setprecision(2)
+		<< "dets=" << diag_dets_;
+	diag_2_ = oss.str();
 }
 
 cv::Mat apple_detection::get_annotated_clone() const {
@@ -564,6 +578,8 @@ void apple_detection::postprocess_loop_() {
 		std::vector<int> keep;
 		cv::dnn::NMSBoxes(boxes, scores, env_.detector_conf, env_.detector_nms, keep);
 
+		int dets = 0;
+
 		// Draw
 		for (int idx : keep) {
 			const cv::Rect& r = boxes[idx];
@@ -572,7 +588,11 @@ void apple_detection::postprocess_loop_() {
 			// Blue dot at center of mass (center of the rect)
 			cv::Point center(r.x + r.width/2, r.y + r.height/2);
 			cv::circle(vis, center, 3, cv::Scalar(255, 0, 0), cv::FILLED, cv::LINE_AA);
+
+			dets++;
 		}
+
+		update_diag_dets_(dets);
 
 		// Publish annotated frame
 		{
