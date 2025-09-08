@@ -88,7 +88,8 @@
         "xloctime": "cpp",
         "xmemory": "cpp",
         "xstddef": "cpp",
-        "xtr1common": "cpp"
+        "xtr1common": "cpp",
+        "ranges": "cpp"
     },
     "cmake.useCMakePresets": "always",
     "cmake.configureOnOpen": true

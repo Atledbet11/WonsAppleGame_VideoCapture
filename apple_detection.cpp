@@ -1,10 +1,412 @@
 #include "apple_detection.hpp"
 #include <iomanip>
 #include <sstream>
+#include <cmath>
 
 using clock_steady = std::chrono::steady_clock;
 using std::chrono::duration_cast;
 using std::chrono::microseconds;
+using fsec = std::chrono::duration<float>;
+
+// apple_track
+
+// Add item up to capacity, remove oldest.
+void apple::add(const cv::Point2f point, std::chrono::steady_clock::time_point time) {
+	//std::lock_guard<std::mutex> lock(apple::apple_mtx_); // Thread safety
+	PointInTime pit = PointInTime(point, time);
+	// If track is at capacity
+	if (track_.size() == capacity_) {
+		track_.pop_back(); // Remove oldest
+	}
+	// Usin emplace to avoid copy/move
+	track_.emplace_front(pit);
+	lastPosition = pit;
+	update_velocity_();
+}
+
+void apple::update_velocity_() {
+	//std::lock_guard<std::mutex> lock(apple::apple_mtx_); // Thread safety
+	using fsec = std::chrono::duration<float>;
+	// Get the current position
+	PointInTime curPIT = apple::lastPosition;
+	PointInTime oldPIT = curPIT;
+	constexpr float minDT = 1e-4f; // 0.1ms
+	// We now need to find the next position
+	// Filter using distance threshold to avoid jitter velocity.
+	for (const PointInTime& pit : apple::track_) {
+		// If distance is greater than the threshold
+		if (dist_px(pit.point, oldPIT.point) > dist_thresh) {
+			// update oldPIT
+			oldPIT = pit;
+			break;
+		}
+	}
+
+	// Now that oldPIT has been updated, we can calculate the velocity.
+	// Time difference
+	float dt = std::chrono::duration_cast<fsec>(curPIT.time - oldPIT.time).count();
+	// Distance as cv::Point2f
+	cv::Point2f dp = curPIT.point - oldPIT.point;
+
+	if (dt <= minDT) {
+		velocity = {0, 0};
+	} else {
+		// Return the velocity vector in pixels/sec
+		velocity = {dp.x / dt, dp.y / dt};
+	}
+
+}
+
+// game_state
+
+void game_state::clear_dets() {
+	//std::lock_guard<std::mutex> lock(game_state::game_state_mtx_);
+	game_state::dets_.points.clear();
+}
+
+int game_state::add_det(cv::Point2f point) {
+	//std::lock_guard<std::mutex> lock(game_state::game_state_mtx_);
+	game_state::dets_.points.push_back(point);
+	return game_state::dets_.points.size();
+}
+
+std::string game_state::get_game_state_string() {
+	//std::lock_guard<std::mutex> lock(game_state::game_state_mtx_);
+	return std::string(apple_order.begin(), apple_order.end());
+}
+
+void game_state::update_apple_positions() {
+	// Sanity check on apple_order size.
+	if (apple_order.size() != 3) {
+		return;
+	}
+	switch(apple_order[0]) {
+		case 'S':
+			sApple.add(lOrigin, clock_steady::now());
+			break;
+		case 'H':
+			hApple.add(lOrigin, clock_steady::now());
+			break;
+		case 'A':
+			aApple.add(lOrigin, clock_steady::now());
+			break;
+	}
+	switch(apple_order[1]) {
+		case 'S':
+			sApple.add(cOrigin, clock_steady::now());
+			break;
+		case 'H':
+			hApple.add(cOrigin, clock_steady::now());
+			break;
+		case 'A':
+			aApple.add(cOrigin, clock_steady::now());
+			break;
+	}
+	switch(apple_order[2]) {
+		case 'S':
+			sApple.add(rOrigin, clock_steady::now());
+			break;
+		case 'H':
+			hApple.add(rOrigin, clock_steady::now());
+			break;
+		case 'A':
+			aApple.add(rOrigin, clock_steady::now());
+			break;
+	}
+	return;
+}
+
+// New methodology.
+void game_state::update_game_state() {
+	//std::lock_guard<std::mutex> lock(game_state::game_state_mtx_);
+	// Make sure there are three dets
+	if (dets_.points.size() != 3) {
+		return;
+	}
+	// Get the current time.
+	std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+	// Sort the list by x
+	dets_.sort_by_x_then_y();
+	// If we are not initialized
+	if (!initialized_) {
+		std::cout << "Initializing!\n";
+		// Now update the apple positions and time.
+		sApple.add(dets_.points[0], t);
+		sApple.add(dets_.points[0], t);
+		lOrigin = dets_.points[0];
+		hApple.add(dets_.points[1], t);
+		hApple.add(dets_.points[1], t);
+		cOrigin = dets_.points[1];
+		aApple.add(dets_.points[2], t);
+		aApple.add(dets_.points[2], t);
+		rOrigin = dets_.points[2];
+
+		apple_order[0] = 'S';
+		apple_order[1] = 'H';
+		apple_order[2] = 'A';
+
+		initialized_ = true;
+		return;
+	}
+	// We are initialized
+
+	// Before we get started
+	// We need to make sure there is movement detected.
+	// If none of the apples have moved, ther is no need to update the gamestate.
+	bool lMove = true, cMove = true, rMove = true;
+	for (cv::Point2f p : dets_.points) {
+		// Calculate the distance for each apple
+		float dist;
+		if (dist_px(p, lOrigin) < dist_thresh && lMove) {
+			lMove = false;
+		}
+		if (dist_px(p, cOrigin) < dist_thresh && cMove) {
+			cMove = false;
+		}
+		if (dist_px(p, rOrigin) < dist_thresh && rMove) {
+			rMove = false;
+		}
+	}
+
+	// If no movement detected
+	if (!lMove && !cMove && !rMove) {
+		// This means all the apples are back to the origin.
+		// If we have a pending swap, perform it here.
+		int a = 0, b = 0;
+		switch(centerOfRotation) {
+			case 'L':
+			case 'l':
+				b = 1;
+				centerOfRotation = char(0);
+				break;
+			case 'C':
+			case 'c':
+				b = 2;
+				centerOfRotation = char(0);
+				break;
+			case 'R':
+			case 'r':
+				a = 1;
+				b = 2;
+				centerOfRotation = char(0);
+				break;
+		}
+		if (a < apple_order.size() && b < apple_order.size() && a != b) {
+			std::swap(apple_order[a], apple_order[b]);
+			update_apple_positions();
+		}
+		return;
+	}
+
+	// Now we need to see which apples are moving
+	// There will be a "center of rotation" either "L" "C" "R" or none.
+	// There should only be two apples moving at a given time.
+	// If two are moving, one is not. Find the one that is not moving.
+	// Use this information to determine the center of rotation.
+	if (lMove && cMove && !rMove) {
+		centerOfRotation = 'L';
+	} else if (lMove && !cMove && rMove) {
+		centerOfRotation = 'C';
+	} else if (!lMove && cMove && rMove) {
+		centerOfRotation = 'R';
+	} else {
+		std::cout << "Unexpected movement! " << lMove << " " << cMove << " " << rMove << "\n";
+	}
+
+	return;
+
+}
+
+void game_state::reset() {
+	// Update the apple order.
+	apple_order[0] = 'S';
+	apple_order[1] = 'H';
+	apple_order[2] = 'A';
+	initialized_ = false;
+	lOrigin = {0.0f, 0.0f};
+	cOrigin = {0.0f, 0.0f};
+	rOrigin = {0.0f, 0.0f};
+	return;
+}
+
+/*
+void game_state::old_update_game_state() {
+	//std::lock_guard<std::mutex> lock(game_state::game_state_mtx_);
+	// Make sure there are three dets
+	if (game_state::dets_.points.size() != 3) {
+		return;
+	}
+	// Get the current time.
+	std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+	// Sort the list by x
+	game_state::dets_.sort_by_x_then_y();
+	// If we are not initialized
+	if (!game_state::initialized_) {
+		// Now update the apple positions and time.
+		game_state::sApple.add(game_state::dets_.points[0], t);
+		game_state::hApple.add(game_state::dets_.points[1], t);
+		game_state::aApple.add(game_state::dets_.points[2], t);
+
+		std::cout << "Initializing!\n";
+
+		game_state::g_state_string_ = "SHA";
+
+		game_state::initialized_ = true;
+		return;
+	}
+	// We are initialized
+
+	// Before we get started
+	// We need to make sure there is movement detected.
+	// If none of the apples have moved, ther is no need to update the gamestate.
+	bool sMove = true, hMove = true, aMove = true;
+	for (cv::Point2f p : game_state::dets_.points) {
+		// Calculate the distance for each apple
+		float dist;
+		if (dist_px(p, game_state::sApple.lastPosition.point) < dist_thresh && sMove) {
+			sMove = false;
+		}
+		if (dist_px(p, game_state::hApple.lastPosition.point) < dist_thresh && hMove) {
+			hMove = false;
+		}
+		if (dist_px(p, game_state::aApple.lastPosition.point) < dist_thresh && aMove) {
+			aMove = false;
+		}
+	}
+
+	// If no movement detected
+	if (!sMove && !hMove && !aMove) {
+		return;
+	}
+
+	// Now we have to figure out what apple is where.
+	// To do this we need to run some calculations.
+	// First is calculate the "predicted" position based off of apple velocity + position.
+	// Because of the way the apples move, x+y velocity can be inconsistent. 
+	// The apples move in v and ^ shapes. And suddenly swap y velocity on the apex.
+	// However, the x velocity seems to remain constant. Weight the x precision higher than the y.
+
+	cv::Point2f sPred, hPred, aPred;
+
+	// Ideally dt should be the same for all three apples. Repeating this calculation is redundant.
+	float dt = std::chrono::duration_cast<fsec>(t - sApple.lastPosition.time).count();
+	sPred = sApple.lastPosition.point + sApple.velocity * dt;
+	hPred = hApple.lastPosition.point + hApple.velocity * dt;
+	aPred = aApple.lastPosition.point + aApple.velocity * dt;
+	sApple.prediction = sPred;
+	hApple.prediction = hPred;
+	aApple.prediction = aPred;
+
+	// Now that we have the predicted positions as a cv::Point2f
+	// We need to determine what apple goes with the current positions.
+	// As stated before the X velocity is most important here.
+	// If the prediction using X only is unclear we can check the Y.
+	// If Y does not clear things up, delay to the next gamestate.
+	int method = 0;
+	float s_delta = 0.0f, h_delta = 0.0f, a_delta = 0.0f, res = 0.0f;
+	size_t sBest = -1,  hBest = -1, aBest = -1;
+
+	// X prediction will be unclear if the dets x values are too similar.
+	do {
+		// Check to see if deltax is usable.
+		// The points are in ascending x value, so absolute value is not important.
+		if (dets_.points[1].x - dets_.points[0].x <= dx_thresh) {
+			// Break out of the while loop and try distance check.
+			break;
+		}
+		if (dets_.points[2].x - dets_.points[0].x <= dx_thresh) {
+			// Break out of the while loop and try distance check.
+			break;
+		}
+		if (dets_.points[2].x - dets_.points[1].x <= dx_thresh) {
+			// Break out of the while loop and try distance check.
+			break;
+		}
+		method = 1;
+	} while(0);
+
+	// 2D predictions will be unclear if apples are too close.
+	do {
+		if (method != 0) {
+			break;
+		}
+		if (dist_px(dets_.points[0], dets_.points[1]) <= d2d_thresh) {
+			break;
+		}
+		if (dist_px(dets_.points[0], dets_.points[2]) <= d2d_thresh) {
+			break;
+		}
+		if (dist_px(dets_.points[1], dets_.points[2]) <= d2d_thresh) {
+			break;
+		}
+		method = 2;
+	} while (0);
+
+	std::cout << "Using method " << method << "\n";
+
+	switch (method) {
+		case 1:
+			s_delta = (std::abs(dets_.points[0].x - sPred.x));
+			h_delta = (std::abs(dets_.points[0].x - hPred.x));
+			a_delta = (std::abs(dets_.points[0].x - aPred.x));
+			std::cout << "sD: " << s_delta << " hD: " << h_delta << " aD: " << a_delta << "\n";
+			sBest = 0;
+			hBest = 0;
+			aBest = 0;
+			for (size_t i = 1; i < dets_.points.size(); i++) {
+				res = std::abs(dets_.points[i].x - sPred.x);
+				s_delta = (res < s_delta) ? (sBest = i, res) : s_delta;
+				res = std::abs(dets_.points[i].x - hPred.x);
+				h_delta = (res < h_delta) ? (hBest = i, res) : h_delta;
+				res = std::abs(dets_.points[i].x - aPred.x);
+				a_delta = (res < a_delta) ? (aBest = i, res) : a_delta;
+			}
+			std::cout << "sD: " << s_delta << " hD: " << h_delta << " aD: " << a_delta << "\n";
+			std::cout << "sB: " << sBest << " hB: " << hBest << " aB: " << aBest << "\n";
+			break;
+		case 2:
+			s_delta = (dist_px(dets_.points[0], sPred));
+			h_delta = (dist_px(dets_.points[0], hPred));
+			a_delta = (dist_px(dets_.points[0], aPred));
+			sBest = 0;
+			hBest = 0;
+			aBest = 0;
+			for (size_t i = 1; i < dets_.points.size(); i++) {
+				res = dist_px(dets_.points[i], sPred);
+				s_delta = (res < s_delta) ? (sBest = i, res) : s_delta;
+				res = dist_px(dets_.points[i], hPred);
+				h_delta = (res < h_delta) ? (hBest = i, res) : h_delta;
+				res = dist_px(dets_.points[i], aPred);
+				a_delta = (res < a_delta) ? (aBest = i, res) : a_delta;
+			}
+			break;
+		default:
+			std::cout << "No valid Method\n";
+			return;
+	}
+
+	// sanity check to make sure a value was asigned
+	// Should never fail here
+	if (sBest == -1 || hBest == -1 || aBest == -1) {
+		std::cout << "Made it here :<\n";
+		return;
+	}
+
+	// Sanity check to make sure none of the apples share a best.
+	if (sBest == hBest || sBest == aBest || hBest == aBest) {
+		std::cout << "Shared best not allowed!\n";
+		return;
+	}
+
+	// By this point we are safe to make assignments.
+	sApple.add(dets_.points[sBest], t);
+	hApple.add(dets_.points[hBest], t);
+	aApple.add(dets_.points[aBest], t);
+
+}
+*/
+
+// apple_detection
 
 // ---- ctor/dtor --------------------------------------------------------------
 
@@ -161,7 +563,26 @@ void apple_detection::update_diag_dets_(int dets) {
 	diag_dets_ = dets;
 	std::ostringstream oss;
 	oss << std::fixed << std::setprecision(2)
-		<< "dets=" << diag_dets_;
+		<< "dets=" << diag_dets_
+		<< "state=" << g_state_string_;
+	diag_2_ = oss.str();
+}
+
+std::string apple_detection::get_game_state_string() {
+	return g_state_.get_game_state_string();
+}
+
+void apple_detection::reset_game_state() {
+	g_state_.reset();
+}
+
+void apple_detection::update_diag_order_() {
+	std::lock_guard<std::mutex> lk(diag_2_mtx_);
+	std::string g_state_string_ = get_game_state_string();
+	std::ostringstream oss;
+	oss << std::fixed << std::setprecision(2)
+		<< "dets=" << diag_dets_
+		<< "state=" << g_state_string_;
 	diag_2_ = oss.str();
 }
 
@@ -421,6 +842,27 @@ void apple_detection::forward_loop_() {
 
 // ---- post-process thread ----------------------------------------------------
 
+void apple_detection::drawCharAbove(cv::Mat& img, char ch, const cv::Point2f& p,
+	const cv::Scalar& color, int fontFace,
+	double fontScale, int thickness, int offsetY) // pixels above the point
+{
+	std::string s(1, ch);
+
+	int baseline = 0;
+	cv::Size ts = cv::getTextSize(s, fontFace, fontScale, thickness, &baseline);
+	baseline += thickness;
+
+	int baseY = static_cast<int>(std::lround(p.y)) - offsetY;
+	int leftX = static_cast<int>(std::lround(p.x)) - ts.width / 2;
+
+	// outline (stroke) + fill for readability
+	cv::putText(img, s, {leftX, baseY}, fontFace, fontScale, {0,0,0}, thickness+2, cv::LINE_AA);
+	cv::putText(img, s, {leftX, baseY}, fontFace, fontScale, color,          thickness,   cv::LINE_AA);
+
+	// optional: mark the point
+	// cv::circle(img, p, 3, {0,255,255}, cv::FILLED, cv::LINE_AA);
+}
+
 static inline cv::Rect clampRect(const cv::Rect& r, const cv::Size& im) {
 	int x = std::max(0, r.x);
 	int y = std::max(0, r.y);
@@ -578,6 +1020,8 @@ void apple_detection::postprocess_loop_() {
 		std::vector<int> keep;
 		cv::dnn::NMSBoxes(boxes, scores, env_.detector_conf, env_.detector_nms, keep);
 
+		// Reset the detection list.
+		apple_detection::g_state_.clear_dets();
 		int dets = 0;
 
 		// Draw
@@ -586,13 +1030,29 @@ void apple_detection::postprocess_loop_() {
 			cv::rectangle(vis, r, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
 
 			// Blue dot at center of mass (center of the rect)
-			cv::Point center(r.x + r.width/2, r.y + r.height/2);
+			cv::Point2f center(r.x + r.width/2, r.y + r.height/2);
 			cv::circle(vis, center, 3, cv::Scalar(255, 0, 0), cv::FILLED, cv::LINE_AA);
 
-			dets++;
+			dets = apple_detection::g_state_.add_det(center);
 		}
 
 		update_diag_dets_(dets);
+		g_state_.update_game_state();
+
+		drawCharAbove(vis, g_state_.sApple.name, g_state_.sApple.lastPosition.point);
+		drawCharAbove(vis, g_state_.hApple.name, g_state_.hApple.lastPosition.point);
+		drawCharAbove(vis, g_state_.aApple.name, g_state_.aApple.lastPosition.point);
+
+		// Draw origin circles.
+		cv::circle(vis, g_state_.lOrigin, dist_thresh ,cv::Scalar(255, 0, 0), 1);
+		cv::circle(vis, g_state_.cOrigin, dist_thresh ,cv::Scalar(255, 0, 0), 1);
+		cv::circle(vis, g_state_.rOrigin, dist_thresh ,cv::Scalar(255, 0, 0), 1);
+
+		/*
+		cv::line(vis, g_state_.sApple.lastPosition.point, g_state_.sApple.prediction, cv::Scalar(255, 0, 0), 4);
+		cv::line(vis, g_state_.hApple.lastPosition.point, g_state_.hApple.prediction, cv::Scalar(255, 0, 0), 4);
+		cv::line(vis, g_state_.aApple.lastPosition.point, g_state_.aApple.prediction, cv::Scalar(255, 0, 0), 4);
+		*/
 
 		// Publish annotated frame
 		{

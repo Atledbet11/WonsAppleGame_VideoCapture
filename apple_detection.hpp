@@ -7,6 +7,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <list>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
@@ -14,6 +15,76 @@
 #ifdef HAVE_OPENCV_CUDAWARPING
 #include <opencv2/cudawarping.hpp>
 #endif
+
+using Clock = std::chrono::steady_clock;
+
+// Apple Tracking
+
+// Shared values
+
+inline float dist_thresh = 25.0f; // Distance needed to count as movement
+inline float dx_thresh   = 8.0f; // Delta X threshold for uncertainty.
+inline float d2d_thresh  = 8.0f; // Distance threshold for uncertainty.
+
+// Helpers
+inline float dist_px(const cv::Point2f& a, const cv::Point2f& b) {
+	float dx = a.x - b.x, dy = a.y - b.y;
+	return std::sqrt(dx*dx + dy*dy);
+}
+
+struct PointInTime {
+	cv::Point2f point;
+	Clock::time_point time;
+	// Constructor
+	PointInTime() : point(cv::Point2f(0.0f, 0.0f)), time(Clock::now()) {}
+	PointInTime( const cv::Point2f p, Clock::time_point t ) : point(p), time(t) {}
+};
+
+class apple {
+public:
+	const char name;
+	cv::Point2f velocity;
+	PointInTime lastPosition;
+	cv::Point2f prediction;
+	apple(char c, int cap) : name(c), capacity_(cap) {}
+	apple(char c) : name(c) {}
+	void add(const cv::Point2f point, std::chrono::steady_clock::time_point time);
+private:
+	std::mutex apple_mtx_;
+	void update_velocity_();
+	std::list<PointInTime> track_;
+	size_t capacity_ = 3;
+};
+
+class game_state {
+public:
+	struct det_vector {
+		std::vector<cv::Point2f> points;
+		void sort_by_x_then_y() { 
+			std::sort(points.begin(), points.end(),
+			[](const cv::Point2f& a, const cv::Point2f& b) {
+				if (a.x == b.x) return a.y < b.y;
+				return a.x < b.x;
+			});
+		}
+	};
+	apple sApple{'S'};
+	apple hApple{'H'};
+	apple aApple{'A'};
+	void clear_dets();
+	int add_det(cv::Point2f point);
+	void update_apple_positions();
+	void update_game_state();
+	void reset();
+	std::string game_state::get_game_state_string();
+	cv::Point2f lOrigin = {0.0f, 0.0f}, cOrigin = {0.0f, 0.0f}, rOrigin = {0.0f, 0.0f};
+private:
+	std::mutex game_state_mtx_;
+	det_vector dets_;
+	std::vector<char> apple_order = {'S', 'H', 'A'};
+	bool initialized_ = false;
+	char centerOfRotation = char(0);
+};
 
 class apple_detection {
 public:
@@ -93,6 +164,15 @@ public:
 	// Thread-safe getter (preferred if you can call this in your display thread)
 	cv::Mat get_annotated_clone() const;
 
+	// Apple Tracking stuff
+	std::string get_game_state_string();
+	void reset_game_state();
+
+	void drawCharAbove(cv::Mat& img, char ch, const cv::Point2f& p,
+		const cv::Scalar& color = {255,255,255}, int fontFace = cv::FONT_HERSHEY_SIMPLEX,
+		double fontScale = 0.6, int thickness = 2, int offsetY = 8); // pixels above the point
+
+
 private:
 	// --- Threads ---
 	void preprocess_loop_();
@@ -104,15 +184,17 @@ private:
 	void update_diag_fwd_(double ms);
 	void update_diag_post_(double ms);
 	void update_diag_dets_(int dets);
+	void update_diag_order_();
 	bool load_if_needed_(); // lazy model load inside forward loop
 
 	// --- Config ---
 	Env       env_;
 	cv::Size  input_size_;
-	float     scalefactor_ = 1.f / 255.f;     // YOLO-style normalization
-	bool      swapRB_      = true;
-	cv::Scalar mean_       = cv::Scalar();    // (0,0,0)
-	bool      letterbox_   = true;
+	float     scalefactor_    = 1.f / 255.f;     // YOLO-style normalization
+	bool      swapRB_         = true;
+	cv::Scalar mean_          = cv::Scalar();    // (0,0,0)
+	bool      letterbox_      = true;
+	int       track_capacity_ = 12;
 
 	// --- State & sync ---
 	std::atomic<bool> running_{false};
@@ -160,4 +242,8 @@ private:
 
 	// Annotated frame guard
 	mutable std::mutex annotated_mtx_;
+
+	// Apple Tracking stuff
+	game_state g_state_;
+	std::string g_state_string_;
 };

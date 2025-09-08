@@ -179,6 +179,9 @@ int main() {
 				if (!disp.isRecording()) disp.startRecording(60);
 				else disp.stopRecording();
 				break;
+			case 'g': case 'G':
+				detector.reset_game_state();
+				break;
 			case 27: case 'q': case 'Q': quit.store(true); break;
 		}
 	});
